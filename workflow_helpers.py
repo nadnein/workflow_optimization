@@ -8,48 +8,11 @@ compare resource usage across pipeline runs.
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
- 
+from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.colors
-import plotly.express as px
 from plotly.subplots import make_subplots
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-RESOURCE_CONFIG = {
-    "CPU": {
-        "contrib_col": "cpu_contrib",
-        "unit": "core-h",
-        "color": "#E63946",
-        "convert": lambda x: x / (1000 * 3600),  # ms → hours
-        "ylabel": "CPU (core-h)",
-        "marker": "o",
-    },
-    "Memory": {
-        "contrib_col": "mem_contrib",
-        "time_col": "memory_time",
-        "unit": "GB-h",
-        "color": "#457B9D",
-        "convert": lambda x: x / (1024**3 * 1000 * 3600),  # byte-ms → GB-h
-        "ylabel": "Memory (GB-h)",
-        "marker": "s",
-    },
-    "IO": {
-        "contrib_col": "io_contrib",
-        "time_col": "io_time",
-        "unit": "GB-h",
-        "color": "#2A9D8F",
-        "convert": lambda x: x / (1024**3 * 1000 * 3600),  # byte-ms → GB-h
-        "ylabel": "I/O (GB-h)",
-        "marker": "^",
-    },
-}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,6 +81,44 @@ def truncate_left(text, max_len=40, prefix="..."):
     # Calculate how many characters from the right we can keep after the prefix
     keep = max_len - len(prefix)
     return prefix + text[-keep:]
+
+
+def _print_group_consistency_summary(
+    group_name: str,
+    group_process_df: pd.DataFrame,
+    group_filenames: List[str],
+    group_labels: List[str],
+    consistent_processes: List[str],
+) -> None:
+    """Print a concise consistency summary for one comparison group."""
+    total_unique = group_process_df["process"].nunique()
+    consistent_set = set(consistent_processes)
+    shared_pct = (len(consistent_set) / total_unique * 100.0) if total_unique else 0.0
+
+    print(f"Consistency: {group_name}")
+
+    exclusive_counts = []
+    for filename, label in zip(group_filenames, group_labels):
+        run_processes = set(
+            group_process_df.loc[group_process_df["filename"] == filename, "process"]
+        )
+        exclusive = sorted(run_processes - consistent_set)
+        exclusive_counts.append(len(exclusive))
+
+    print(
+        f"  Shared: {len(consistent_set)}/{total_unique} process(es) "
+        f"across {len(group_labels)} run(s) ({shared_pct:.1f}%)"
+    )
+    if sum(exclusive_counts) == 0:
+        print("  Run-specific: none")
+    else:
+        run_specific_summary = ", ".join(
+            f"{label} {count}"
+            for label, count in zip(group_labels, exclusive_counts)
+        )
+        print(f"  Run-specific: {run_specific_summary}")
+
+    print()
 
 
 def make_display_labels(names, separator=":", max_len=40, prefix="..."):
@@ -262,10 +263,10 @@ def load_comparison_groups(comparison_groups: Dict) -> Tuple[pd.DataFrame, pd.Da
     Returns:
         Tuple of (run_summary_df, process_df, all_trace_files, all_labels)
     """
-    print(f"Loading {len(comparison_groups)} comparison group(s):")
-    for group_name in comparison_groups:
-        group = comparison_groups[group_name]
-        print(f"  • {group_name}: {len(group['trace_files'])} trace file(s)")
+    print("Comparison Groups")
+    print(f"  Total: {len(comparison_groups)}")
+    for group_name, group in comparison_groups.items():
+        print(f"  - {group_name}: {len(group['trace_files'])} run(s)")
     print()
  
     run_results = []
@@ -281,23 +282,26 @@ def load_comparison_groups(comparison_groups: Dict) -> Tuple[pd.DataFrame, pd.Da
         if not labels_group or len(labels_group) != len(trace_files_group):
             labels_group = [f.stem for f in trace_files_group]
  
-        print(f"Loading {group_name}:")
+        print(f"Runs: {group_name}")
         for trace_file, label in zip(trace_files_group, labels_group):
-            print(f"  • {trace_file.name}")
             df_trace = load_and_preprocess_trace(trace_file, verbose=False)
-            print(f"    → {len(df_trace)} completed tasks")
- 
-            # Run-level totals
-            run_metrics = compute_resource_contributions(df_trace)
+            run_metrics = build_run_summary(df_trace)
             run_metrics["filename"] = trace_file.stem
             run_metrics["group"] = group_name
             run_metrics["label"] = label
+
+            print(
+                f"  - {label}"
+                f" | {len(df_trace)} task(s)"
+                f" | {run_metrics['process_count']} process(es)"
+                f" | {trace_file.name}"
+            )
+ 
+            # Run-level summary
             run_results.append(run_metrics)
  
-            # Per-process metrics
-            pp_contrib = compute_per_process_contributions(df_trace)
-            pp_eff = compute_per_process_efficiency_metrics(df_trace)
-            pp = pp_contrib.merge(pp_eff, on="process", how="left")
+            # Per-process summary
+            pp = build_per_process_summary(df_trace)
             pp["filename"] = trace_file.stem
             pp["group"] = group_name
             pp["label"] = label
@@ -313,9 +317,13 @@ def load_comparison_groups(comparison_groups: Dict) -> Tuple[pd.DataFrame, pd.Da
  
     run_summary_df = pd.DataFrame(run_results)
     process_df = pd.concat(process_records, ignore_index=True)
- 
+    process_df = annotate_consistent_processes(process_df, comparison_groups)
+
+    print("Summary")
     print(
-        f"✓ Ready: {len(run_summary_df)} run(s) across {len(comparison_groups)} group(s)"
+        f"  {len(run_summary_df)} run(s)"
+        f" | {process_df['process'].nunique()} unique process(es)"
+        f" | {len(comparison_groups)} group(s)"
     )
  
     return run_summary_df, process_df, all_trace_files, all_labels
@@ -324,270 +332,360 @@ def load_comparison_groups(comparison_groups: Dict) -> Tuple[pd.DataFrame, pd.Da
 # RESOURCE CALCULATIONS
 # ══════════════════════════════════════════════════════════════════════════════
  
-def compute_resource_contributions(df):
-    """Compute run-level CPU, Memory, and I/O contribution scores.
-
-    All three metrics represent total resource consumption weighted by time:
-
-      cpu_time    = sum(realtime × cores_used)  — total CPU-core-milliseconds
-      memory_time = sum(realtime × bytes_used)  — total byte-milliseconds of memory
-      io_time     = sum(realtime × bytes_io)    — total byte-milliseconds of I/O
-
-    Returns a plain dict — one row's worth of data — intended to be collected
-    into a run-summary DataFrame alongside other runs.
-    """
-    # CPU: convert %cpu to number of cores (e.g., 500% → 5.0 cores), then weight by wall-clock time
-    cpu_time = (df["realtime"] * (df["%cpu"] / 100.0)).sum()
-
-    # Memory: total byte-milliseconds (memory usage × time)
-    memory_time = (df["peak_rss"] * df["realtime"]).sum()
-
-    # I/O: total byte-milliseconds (I/O bytes × time)
-    # Prefer read_bytes/write_bytes (actual disk bytes); fall back to
-    # rchar/wchar (kernel I/O characters) if byte columns are absent
+def _get_io_bytes_series(df: pd.DataFrame) -> pd.Series:
+    """Return the best available per-task I/O byte series."""
     if "read_bytes" in df.columns and "write_bytes" in df.columns:
-        io_bytes = df["read_bytes"].fillna(0) + df["write_bytes"].fillna(0)
-        io_time = (io_bytes * df["realtime"]).sum()
-    elif "rchar" in df.columns and "wchar" in df.columns:
-        io_bytes = df["rchar"].fillna(0) + df["wchar"].fillna(0)
-        io_time = (io_bytes * df["realtime"]).sum()
-    else:
-        io_time = 0  # trace has no I/O columns at all
+        return df["read_bytes"].fillna(0) + df["write_bytes"].fillna(0)
+    if "rchar" in df.columns and "wchar" in df.columns:
+        return df["rchar"].fillna(0) + df["wchar"].fillna(0)
+    return pd.Series(0, index=df.index, dtype=float)
 
-    total_runtime = df["realtime"].sum()
 
-    # Compute absolute total I/O bytes for informational purposes
-    if "read_bytes" in df.columns:
-        total_io_bytes = (df["read_bytes"].fillna(0) + df["write_bytes"].fillna(0)).sum()
-    else:
-        total_io_bytes = (df["rchar"].fillna(0) + df["wchar"].fillna(0)).sum()
+def add_runtime_and_resource_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add core runtime, CPU, memory, and I/O usage columns used by summaries."""
+    work = df.copy()
+    work["runtime_hours"] = work["realtime"] / 3_600_000.0
+    work["cpu_used_cores"] = work["%cpu"] / 100.0
+    work["mem_used_gb"] = work["peak_rss"] / (1024**3)
+    work["io_bytes"] = _get_io_bytes_series(work)
+    work["io_gb"] = work["io_bytes"] / (1024**3)
+    return work
 
+
+def add_resource_contribution_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add resource contribution columns derived from runtime and usage."""
+    work = add_runtime_and_resource_columns(df)
+    work["cpu_h"] = work["cpu_used_cores"] * work["runtime_hours"]
+    work["memory_h"] = work["mem_used_gb"] * work["runtime_hours"]
+    return work
+
+
+def compute_run_general_summary(df: pd.DataFrame) -> Dict[str, float]:
+    """Compute run-level counts and overall runtime."""
     return {
-        "cpu_time": cpu_time,                   # total CPU-core-milliseconds across all tasks
-        "memory_time": memory_time,             # total byte-milliseconds of memory usage across all tasks
-        "io_time": io_time,                     # total byte-milliseconds of I/O across all tasks   
-        "total_runtime": total_runtime,         # sum of all task wall-clock times (ms)
-        "total_io_bytes": total_io_bytes,       # raw byte count for reference
         "task_count": len(df),
+        "process_count": df["process"].nunique(),
+        "total_runtime_h": df["realtime"].sum() / 3_600_000.0,
     }
 
 
-def compute_per_process_contributions(df):
-    """Compute per-process resource contributions in *hours* + variability.
+def compute_run_resource_summary(df: pd.DataFrame) -> Dict[str, float]:
+    """Compute run-level CPU, memory, and I/O contribution totals."""
+    work = add_resource_contribution_columns(df)
+    return {
+        "cpu_h": work["cpu_h"].sum(),
+        "memory_h": work["memory_h"].sum(),
+        "io_gb": work["io_gb"].sum(),
+        "total_io_bytes": work["io_bytes"].sum(),
+    }
 
-    Returns a DataFrame with:
-        process,
-        cpu_h, memory_h, io_h              → total contribution (sum)
-        cpu_h_std, memory_h_std, io_h_std  → variation across tasks
-        cpu_h_mean, memory_h_mean, io_h_mean → per-task averages
-    """
 
-    work = df.copy()
+def build_run_summary(df: pd.DataFrame) -> Dict[str, float]:
+    """Build one run-summary row from general and resource summary columns."""
+    return {
+        **compute_run_general_summary(df),
+        **compute_run_resource_summary(df),
+    }
 
-    # ── Time in hours ─────────────────────────────────────────────────────────
-    work["runtime_hours"] = work["realtime"] / 3_600_000.0  # ms → hours
 
-    # ── CPU (core-hours) ──────────────────────────────────────────────────────
-    work["cpu_used_cores"] = work["%cpu"] / 100.0
-    work["cpu_h"] = work["cpu_used_cores"] * work["runtime_hours"]
-
-    # ── Memory (GB-hours) ─────────────────────────────────────────────────────
-    work["mem_used_gb"] = work["peak_rss"] / (1024**3)
-    work["memory_h"] = work["mem_used_gb"] * work["runtime_hours"]
-
-    # ── I/O (GB-hours, best-effort) ───────────────────────────────────────────
-    if "read_bytes" in work.columns and "write_bytes" in work.columns:
-        io_bytes = work["read_bytes"].fillna(0) + work["write_bytes"].fillna(0)
-    elif "rchar" in work.columns and "wchar" in work.columns:
-        io_bytes = work["rchar"].fillna(0) + work["wchar"].fillna(0)
-    else:
-        io_bytes = pd.Series(0, index=work.index)
-
-    work["io_gb"] = io_bytes / (1024**3)
-    work["io_h"] = work["io_gb"] * work["runtime_hours"]
-
-    # ── Aggregate per process ─────────────────────────────────────────────────
-    metrics = (
-        work.groupby("process")
+def compute_per_process_general_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-process counts used across multiple summaries."""
+    return (
+        df.groupby("process")
         .agg(
-            # totals
-            cpu_h=("cpu_h", "sum"),
-            memory_h=("memory_h", "sum"),
-            io_h=("io_h", "sum"),
-            
-            # means 
-            cpu_h_mean=("cpu_h", "mean"),
-            memory_h_mean=("memory_h", "mean"),
-            io_h_mean=("io_h", "mean"),
-
-            # variability (for error bars)
-            cpu_h_std=("cpu_h", "std"),
-            memory_h_std=("memory_h", "std"),
-            io_h_std=("io_h", "std"),
+            n_tasks=("process", "size"),
+            total_runtime_hours=("realtime", lambda s: s.sum() / 3_600_000.0),
         )
         .reset_index()
     )
 
-    # ── Handle NaNs (single-task processes) ───────────────────────────────────
-    for col in ["cpu_h_std", "memory_h_std", "io_h_std"]:
+
+def compute_per_process_usage_metrics(work: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-process total resource burdens."""
+    return (
+        work.groupby("process")
+        .agg(
+            cpu_h=("cpu_h", "sum"),
+            memory_h=("memory_h", "sum"),
+            io_gb=("io_gb", "sum"),
+        )
+        .reset_index()
+    )
+
+
+def add_efficiency_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add requested-vs-used resource columns and efficiency metrics."""
+    work = add_resource_contribution_columns(df)
+    work["mem_requested_gb"] = work["memory"] / (1024**3)
+    work["time_requested_hours"] = work["time"] / 3_600_000.0
+    work["task_cpu_efficiency"] = (work["cpu_used_cores"] / work["cpus"]) * 100.0
+    work["task_mem_efficiency"] = (work["mem_used_gb"] / work["mem_requested_gb"]) * 100.0
+    work["task_time_efficiency"] = (
+        work["runtime_hours"] / work["time_requested_hours"]
+    ) * 100.0
+    work["cpu_requested_h"] = work["cpus"] * work["runtime_hours"]
+    work["memory_requested_h"] = work["mem_requested_gb"] * work["runtime_hours"]
+    return work
+
+
+def _report_efficiency_exceedances(work: pd.DataFrame) -> None:
+    """Print warnings for tasks that exceeded requested resources."""
+    cpu_exceeded = work["task_cpu_efficiency"] > 100.0
+    mem_exceeded = work["task_mem_efficiency"] > 100.0
+    time_exceeded = work["task_time_efficiency"] > 100.0
+
+    if cpu_exceeded.any():
+        n_exceed = cpu_exceeded.sum()
+        print(f"⚠️  WARNING: {n_exceed} tasks used more CPU cores than requested!")
+        print("   Scheduler may not be enforcing CPU limits properly.")
+        exceed_details = work[cpu_exceeded][
+            ["process", "cpus", "cpu_used_cores", "task_cpu_efficiency"]
+        ].head(5)
+        print("   Examples (showing up to 5):")
+        for _, row in exceed_details.iterrows():
+            print(
+                f"     {row['process']}: requested {row['cpus']:.1f} cores, "
+                f"used {row['cpu_used_cores']:.1f} ({row['task_cpu_efficiency']:.1f}%)"
+            )
+        print()
+
+    if mem_exceeded.any():
+        n_exceed = mem_exceeded.sum()
+        print(f"⚠️  WARNING: {n_exceed} tasks used more memory than requested!")
+        print("   Memory limits may not be enforced properly.")
+        exceed_details = work[mem_exceeded][
+            ["process", "mem_requested_gb", "mem_used_gb", "task_mem_efficiency"]
+        ].head(5)
+        print("   Examples (showing up to 5):")
+        for _, row in exceed_details.iterrows():
+            print(
+                f"     {row['process']}: requested {row['mem_requested_gb']:.2f} GB, "
+                f"used {row['mem_used_gb']:.2f} GB ({row['task_mem_efficiency']:.1f}%)"
+            )
+        print()
+
+    if time_exceeded.any():
+        n_exceed = time_exceeded.sum()
+        print(f"⚠️  WARNING: {n_exceed} tasks ran longer than requested time!")
+        print("   Time limits may not be enforced, or limits are set too tight.")
+        exceed_details = work[time_exceeded][
+            ["process", "time_requested_hours", "runtime_hours", "task_time_efficiency"]
+        ].head(5)
+        print("   Examples (showing up to 5):")
+        for _, row in exceed_details.iterrows():
+            print(
+                f"     {row['process']}: requested {row['time_requested_hours']:.2f} h, "
+                f"took {row['runtime_hours']:.2f} h ({row['task_time_efficiency']:.1f}%)"
+            )
+        print()
+
+
+def compute_per_process_efficiency_metrics(work: pd.DataFrame, verbose: bool = True):
+    """Compute per-process weighted efficiencies.
+
+    For each task we compare what was requested (cpus, memory, time) against what
+    was actually used (%cpu, peak_rss, realtime).
+
+    The aggregate efficiencies are ratios of summed totals:
+      - CPU efficiency is runtime-weighted in core-hours
+      - Memory efficiency is runtime-weighted in GB-hours
+      - Time efficiency is weighted by requested time
+
+    Args:
+        work: Prepared task-level DataFrame with derived resource and efficiency columns
+
+    Tasks with zero memory or zero realtime are excluded because they would
+    produce division-by-zero errors or meaningless efficiency values.
+
+    Returns a DataFrame with one row per process.
+    """
+    if work.empty:
+        return pd.DataFrame()
+
+    if verbose:
+        _report_efficiency_exceedances(work)
+
+    metrics = (
+        work.groupby("process")
+        .agg(
+            used_runtime_h=("runtime_hours", "sum"),
+            cpu_h=("cpu_h", "sum"),
+            memory_h=("memory_h", "sum"),
+            cpu_requested_h=("cpu_requested_h", "sum"),
+            memory_requested_h=("memory_requested_h", "sum"),
+            time_requested_h=("time_requested_hours", "sum"),
+        )
+        .reset_index()
+    )
+
+    metrics["cpu_efficiency"] = (
+        metrics["cpu_h"] / metrics["cpu_requested_h"]
+    ) * 100.0
+    metrics["mem_efficiency"] = (
+        metrics["memory_h"] / metrics["memory_requested_h"]
+    ) * 100.0
+    metrics["time_efficiency"] = (
+        metrics["used_runtime_h"] / metrics["time_requested_h"]
+    ) * 100.0
+    metrics["cpu_efficiency"] = metrics["cpu_efficiency"].replace([np.inf, -np.inf], np.nan)
+    metrics["mem_efficiency"] = metrics["mem_efficiency"].replace([np.inf, -np.inf], np.nan)
+    metrics["time_efficiency"] = metrics["time_efficiency"].replace([np.inf, -np.inf], np.nan)
+
+    return (
+        metrics.drop(columns=["used_runtime_h", "cpu_h", "memory_h"])
+        .sort_values("process")
+        .reset_index(drop=True)
+    )
+
+
+def compute_per_process_variability_metrics(work: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-process variability and task-level spread metrics."""
+    if work.empty:
+        return pd.DataFrame(columns=["process"])
+
+    metrics = (
+        work.groupby("process")
+        .agg(
+            avg_cpus_used=("cpu_used_cores", "mean"),
+            std_cpus_used=("cpu_used_cores", "std"),
+            avg_mem_used_gb=("mem_used_gb", "mean"),
+            std_mem_used_gb=("mem_used_gb", "std"),
+            avg_runtime_hours=("runtime_hours", "mean"),
+            std_runtime_hours=("runtime_hours", "std"),
+        )
+        .reset_index()
+    )
+
+    fill_zero_cols = ["std_cpus_used", "std_mem_used_gb", "std_runtime_hours"]
+    for col in fill_zero_cols:
         metrics[col] = metrics[col].fillna(0)
 
     return metrics
 
 
+def _normalize_series(series: pd.Series) -> pd.Series:
+    """Normalize a series to the range [0, 1]."""
+    series = pd.Series(series).fillna(0)
+    max_val = series.max()
+    if max_val <= 0 or pd.isna(max_val):
+        return pd.Series(np.zeros(len(series)), index=series.index)
+    return series / max_val
 
-def compute_per_process_efficiency_metrics(df, cpu_waste_weight=10.0):
-    """Compute how efficiently each process uses its requested CPU, memory, and time.
 
-    For each task we compare what was *requested* (cpus, memory, time) against what
-    was *actually used* (%cpu, peak_rss, realtime) and convert the gap into wasted
-    resource-hours — a concrete, cost-relevant number:
+def _safe_cv(mean: pd.Series, std: pd.Series) -> pd.Series:
+    """Return coefficient of variation while handling zero means safely."""
+    mean = pd.Series(mean).replace(0, np.nan)
+    std = pd.Series(std).fillna(0)
+    return std / mean
 
-      cpu_hours_wasted     = (cpus_requested - cpus_used)  × runtime_hours
-      mem_gb_hours_wasted  = (mem_requested_gb - mem_used_gb) × runtime_hours
-      time_hours_wasted    = time_requested - time_used (in hours)
 
-    These are then aggregated per process and combined into a single
-    total_waste score that ranks processes from highest to lowest
-    optimisation priority.
+def _normalize_weight_group(weights: Dict[str, float]) -> Dict[str, float]:
+    """Normalize a weight dictionary so the values sum to 1."""
+    total = sum(weights.values())
+    if total <= 0:
+        n = len(weights)
+        return {k: 1 / n for k in weights}
+    return {k: v / total for k, v in weights.items()}
 
-    Args:
-        df: DataFrame with Nextflow trace data
-        cpu_waste_weight: Scaling factor for CPU-hours in total_waste calculation.
-                         Adjust based on your infrastructure's relative cost of CPU vs memory.
-                         Default 10.0 means 1 CPU-hour costs ~10× a GB-hour of memory.
 
-    Tasks with zero memory or zero realtime are excluded because they would
-    produce division-by-zero errors or meaningless efficiency values.
+def add_optimization_priority_columns(
+    metrics: pd.DataFrame,
+    impact_weights: Dict[str, float] | None = None,
+    inefficiency_weights: Dict[str, float] | None = None,
+    variability_weights: Dict[str, float] | None = None,
+) -> pd.DataFrame:
+    """Add optimization-priority components to a per-process summary table."""
+    metrics = metrics.copy()
 
-    Returns a DataFrame sorted by total_waste descending (worst first), with
-    one row per process.
-    """
-    work = df.copy()
-    # Drop tasks without valid memory or runtime — can't compute efficiency for them
-    work = work[(work["memory"] > 0) & (work["realtime"] > 0)].copy()
-    if work.empty:
-        return pd.DataFrame()
+    if impact_weights is None:
+        impact_weights = {
+            "cpu_cost": 0.4,
+            "mem_cost": 0.3,
+            "time_cost": 0.3,
+        }
 
-    # ── Per-task efficiency calculations ─────────────────────────────────────
-    work["runtime_hours"] = work["realtime"] / 3_600_000.0  # ms → hours
+    if inefficiency_weights is None:
+        inefficiency_weights = {
+            "cpu_ineff": 0.4,
+            "mem_ineff": 0.3,
+            "time_ineff": 0.3,
+        }
 
-    # Actual CPU usage in cores (e.g. %cpu=500 means 5.0 cores used)
-    work["cpu_used_cores"] = work["%cpu"] / 100.0
-    # Efficiency as a percentage of what was requested
-    work["cpu_efficiency"] = (work["cpu_used_cores"] / work["cpus"]) * 100.0
+    if variability_weights is None:
+        variability_weights = {
+            "runtime_cv": 0.6,
+            "cpu_cv": 0.2,
+            "mem_cv": 0.2,
+        }
 
-    work["mem_requested_gb"] = work["memory"] / (1024**3)   # bytes → GB
-    work["mem_used_gb"] = work["peak_rss"] / (1024**3)      # bytes → GB
-    work["mem_efficiency"] = (work["mem_used_gb"] / work["mem_requested_gb"]) * 100.0
+    impact_weights = _normalize_weight_group(impact_weights)
+    inefficiency_weights = _normalize_weight_group(inefficiency_weights)
+    variability_weights = _normalize_weight_group(variability_weights)
 
-    # Time efficiency: compare actual runtime against requested time
-    work["time_requested_hours"] = work["time"] / 3_600_000.0  # ms → hours
-    # Efficiency: how much of the requested time was actually used
-    work["time_efficiency"] = (work["runtime_hours"] / work["time_requested_hours"]) * 100.0
-    # Wasted time: requested time that wasn't used
-    work["time_hours_wasted"] = (work["time_requested_hours"] - work["runtime_hours"]).clip(lower=0)
+    metrics["_cpu_cost"] = metrics["cpu_h"]
+    metrics["_mem_cost"] = metrics["memory_h"]
+    metrics["_time_cost"] = metrics["total_runtime_hours"]
 
-    # ── Check for resource over-allocation ────────────────────────────────────
-    # Warn if tasks used more resources than requested (scheduler didn't enforce limits)
-    cpu_exceeded = work["cpu_efficiency"] > 100.0  
-    mem_exceeded = work["mem_efficiency"] > 100.0
-    time_exceeded = work["time_efficiency"] > 100.0
-    
-    if cpu_exceeded.any():
-        n_exceed = cpu_exceeded.sum()
-        print(f"⚠️  WARNING: {n_exceed} tasks used more CPU cores than requested!")
-        print(f"   Scheduler may not be enforcing CPU limits properly.")
-        exceed_details = work[cpu_exceeded][["process", "cpus", "cpu_used_cores", "cpu_efficiency"]].head(5)
-        print(f"   Examples (showing up to 5):")
-        for _, row in exceed_details.iterrows():
-            print(f"     {row['process']}: requested {row['cpus']:.1f} cores, used {row['cpu_used_cores']:.1f} ({row['cpu_efficiency']:.1f}%)")
-        print()
-    
-    if mem_exceeded.any():
-        n_exceed = mem_exceeded.sum()
-        print(f"⚠️  WARNING: {n_exceed} tasks used more memory than requested!")
-        print(f"   Memory limits may not be enforced properly.")
-        exceed_details = work[mem_exceeded][["process", "mem_requested_gb", "mem_used_gb", "mem_efficiency"]].head(5)
-        print(f"   Examples (showing up to 5):")
-        for _, row in exceed_details.iterrows():
-            print(f"     {row['process']}: requested {row['mem_requested_gb']:.2f} GB, used {row['mem_used_gb']:.2f} GB ({row['mem_efficiency']:.1f}%)")
-        print()
-    
-    if time_exceeded.any():
-        n_exceed = time_exceeded.sum()
-        print(f"⚠️  WARNING: {n_exceed} tasks ran longer than requested time!")
-        print(f"   Time limits may not be enforced, or limits are set too tight.")
-        exceed_details = work[time_exceeded][["process", "time_requested_hours", "runtime_hours", "time_efficiency"]].head(5)
-        print(f"   Examples (showing up to 5):")
-        for _, row in exceed_details.iterrows():
-            print(f"     {row['process']}: requested {row['time_requested_hours']:.2f} h, took {row['runtime_hours']:.2f} h ({row['time_efficiency']:.1f}%)")
-        print()
+    metrics["_cpu_cost_norm"] = _normalize_series(metrics["_cpu_cost"])
+    metrics["_mem_cost_norm"] = _normalize_series(metrics["_mem_cost"])
+    metrics["_time_cost_norm"] = _normalize_series(metrics["_time_cost"])
 
-    # Wasted resources = gap between requested and used, floored at zero
-    # (clip prevents negative waste when usage briefly exceeds the request)
-    work["cpu_hours_wasted"] = (work["cpus"] - work["cpu_used_cores"]).clip(
-        lower=0
-    ) * work["runtime_hours"]
-    work["mem_gb_hours_wasted"] = (work["mem_requested_gb"] - work["mem_used_gb"]).clip(
-        lower=0
-    ) * work["runtime_hours"]
-
-    # ── Aggregate per process ─────────────────────────────────────────────────
-    metrics = (
-        work.groupby("process")
-        .agg(
-            n_tasks=("process", "size"),
-            avg_cpus_requested=("cpus", "mean"),
-            std_cpus_requested=("cpus", "std"),
-            avg_cpus_used=("cpu_used_cores", "mean"),
-            std_cpus_used=("cpu_used_cores", "std"),
-            avg_cpu_efficiency=("cpu_efficiency", "mean"),
-            std_cpu_efficiency=("cpu_efficiency", "std"),
-            avg_mem_requested_gb=("mem_requested_gb", "mean"),
-            std_mem_requested_gb=("mem_requested_gb", "std"),
-            avg_mem_used_gb=("mem_used_gb", "mean"),
-            std_mem_used_gb=("mem_used_gb", "std"),
-            avg_mem_efficiency=("mem_efficiency", "mean"),
-            std_mem_efficiency=("mem_efficiency", "std"),
-            avg_time_requested_hours=("time_requested_hours", "mean"),
-            std_time_requested_hours=("time_requested_hours", "std"),
-            avg_time_efficiency=("time_efficiency", "mean"),
-            std_time_efficiency=("time_efficiency", "std"),
-            avg_runtime_hours=("runtime_hours", "mean"),
-            std_runtime_hours=("runtime_hours", "std"),
-            total_runtime_hours=("runtime_hours", "sum"),
-            std_total_runtime_hours=("runtime_hours", "std"),
-            total_cpu_hours_wasted=("cpu_hours_wasted", "sum"),
-            total_mem_gb_hours_wasted=("mem_gb_hours_wasted", "sum"),
-            total_time_hours_wasted=("time_hours_wasted", "sum"),
-        )
-        .reset_index()
+    metrics["_impact"] = (
+        impact_weights["cpu_cost"] * metrics["_cpu_cost_norm"] +
+        impact_weights["mem_cost"] * metrics["_mem_cost_norm"] +
+        impact_weights["time_cost"] * metrics["_time_cost_norm"]
     )
-    # Fill NaN stds (single-task processes) with 0
-    std_cols = [
-        "std_cpu_efficiency", "std_mem_efficiency", "std_time_efficiency",
-        "std_cpus_used", "std_cpus_requested", "std_mem_used_gb", "std_mem_requested_gb",
-        "std_time_requested_hours", "std_runtime_hours", "std_total_runtime_hours"
-    ]
-    for col in std_cols:
-        if col in metrics.columns:
-            metrics[col] = metrics[col].fillna(0)
 
-    # overall_efficiency = simple average of CPU, memory, and time efficiency (%)
-    metrics["overall_efficiency"] = (
-        metrics["avg_cpu_efficiency"] + metrics["avg_mem_efficiency"] + metrics["avg_time_efficiency"]
-    ) / 3.0
+    metrics["_cpu_ineff"] = 1 - metrics["cpu_efficiency"] / 100
+    metrics["_mem_ineff"] = 1 - metrics["mem_efficiency"] / 100
+    metrics["_time_ineff"] = 1 - metrics["time_efficiency"] / 100
 
-    # total_waste = composite optimisation priority score.
-    # CPU-hours are scaled by cpu_waste_weight to reflect their relative cost
-    # compared to memory and time (adjust based on your infrastructure pricing).
-    metrics["total_waste"] = (
-        metrics["total_cpu_hours_wasted"] * cpu_waste_weight
-        + metrics["total_mem_gb_hours_wasted"]
-        + metrics["total_time_hours_wasted"]
+    metrics["_inefficiency"] = (
+        inefficiency_weights["cpu_ineff"] * metrics["_cpu_ineff"] +
+        inefficiency_weights["mem_ineff"] * metrics["_mem_ineff"] +
+        inefficiency_weights["time_ineff"] * metrics["_time_ineff"]
     )
-    return metrics.sort_values("total_waste", ascending=False).reset_index(drop=True)
+
+    metrics["_runtime_cv"] = _safe_cv(metrics["avg_runtime_hours"], metrics["std_runtime_hours"])
+    metrics["_cpu_cv"] = _safe_cv(metrics["avg_cpus_used"], metrics["std_cpus_used"])
+    metrics["_mem_cv"] = _safe_cv(metrics["avg_mem_used_gb"], metrics["std_mem_used_gb"])
+
+    metrics["_runtime_cv_norm"] = _normalize_series(metrics["_runtime_cv"].fillna(0))
+    metrics["_cpu_cv_norm"] = _normalize_series(metrics["_cpu_cv"].fillna(0))
+    metrics["_mem_cv_norm"] = _normalize_series(metrics["_mem_cv"].fillna(0))
+
+    metrics["_variability"] = (
+        variability_weights["runtime_cv"] * metrics["_runtime_cv_norm"] +
+        variability_weights["cpu_cv"] * metrics["_cpu_cv_norm"] +
+        variability_weights["mem_cv"] * metrics["_mem_cv_norm"]
+    )
+
+    metrics["priority"] = metrics["_impact"] * (
+        metrics["_inefficiency"] + metrics["_variability"]
+    )
+
+    return metrics
+
+
+def build_per_process_summary(
+    df: pd.DataFrame, verbose: bool = True
+) -> pd.DataFrame:
+    """Build the complete per-process summary table."""
+    general = compute_per_process_general_summary(df)
+    work = add_efficiency_columns(df)
+    valid_work = work[(work["memory"] > 0) & (work["realtime"] > 0)].copy()
+    usage = compute_per_process_usage_metrics(work)
+    efficiency = compute_per_process_efficiency_metrics(valid_work, verbose=verbose)
+    variability = compute_per_process_variability_metrics(valid_work)
+    summary = (
+        general.merge(usage, on="process", how="left")
+        .merge(efficiency, on="process", how="left")
+        .merge(variability, on="process", how="left", suffixes=("", "_dup"))
+    )
+    dup_cols = [col for col in summary.columns if col.endswith("_dup")]
+    if dup_cols:
+        summary = summary.drop(columns=dup_cols)
+    return summary
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROCESS CONSISTENCY
@@ -638,1020 +736,394 @@ def identify_consistent_processes(process_df, run_files, run_labels, verbose=Tru
     
     return consistent_processes.tolist()
 
+
+def annotate_consistent_processes(
+    process_df: pd.DataFrame, comparison_groups: Dict, verbose: bool = True
+) -> pd.DataFrame:
+    """Add an ``is_consistent`` flag showing whether each process is present in all runs of its group."""
+    process_df = process_df.copy()
+    process_df["is_consistent"] = False
+
+    for group_name, group_config in comparison_groups.items():
+        group_trace_files = group_config["trace_files"]
+        group_labels = group_config.get("labels")
+
+        if not group_labels or len(group_labels) != len(group_trace_files):
+            group_labels = [f.stem for f in group_trace_files]
+
+        group_filenames = [f.stem for f in group_trace_files]
+        group_mask = process_df["group"] == group_name
+        group_process_df = process_df[group_mask]
+
+        if len(group_trace_files) == 1:
+            if verbose:
+                _print_group_consistency_summary(
+                    group_name=group_name,
+                    group_process_df=group_process_df,
+                    group_filenames=group_filenames,
+                    group_labels=group_labels,
+                    consistent_processes=sorted(group_process_df["process"].unique()),
+                )
+            process_df.loc[group_mask, "is_consistent"] = True
+            continue
+
+        consistent_procs = identify_consistent_processes(
+            group_process_df, group_filenames, group_labels, verbose=False
+        )
+
+        process_df.loc[
+            group_mask & process_df["process"].isin(consistent_procs),
+            "is_consistent",
+        ] = True
+
+        if verbose:
+            _print_group_consistency_summary(
+                group_name=group_name,
+                group_process_df=group_process_df,
+                group_filenames=group_filenames,
+                group_labels=group_labels,
+                consistent_processes=consistent_procs,
+            )
+
+    return process_df
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PLOTTING FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
-def create_optimization_bubble_chart(
-    metrics, title="Nextflow Process Optimization Opportunities"
-):
-    if metrics.empty:
-        fig = go.Figure()
-        fig.add_annotation(
-            text="No process metrics available",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5, showarrow=False, font=dict(size=18)
+
+def create_process_composition_plot(pp, run_label, sort_by):
+    """Plot per-process burdens as ranked horizontal small multiples."""
+    plot_cols = {
+        "cpu_h": "CPU burden (core-h)",
+        "memory_h": "Memory burden proxy (GB-h)",
+        "total_runtime_hours": "Runtime (h)",
+        "io_gb": "I/O volume (GB)",
+    }
+    if sort_by not in plot_cols:
+        raise ValueError(
+            f"sort_by must be one of {list(plot_cols)}, got {sort_by!r}"
         )
-        return fig
 
-    # Bubble sizes: total runtime
-    runtime_values = metrics["total_runtime_hours"].to_numpy()
-    if np.nanmax(runtime_values) > np.nanmin(runtime_values):
-        norm_runtime = (runtime_values - np.nanmin(runtime_values)) / (
-            np.nanmax(runtime_values) - np.nanmin(runtime_values)
+    pp_sorted = pp.sort_values(sort_by, ascending=False).head(12).copy()
+    if "process_display" not in pp_sorted.columns:
+        pp_sorted["process_display"] = pp_sorted["process"]
+    if "process_name" not in pp_sorted.columns:
+        pp_sorted["process_name"] = pp_sorted["process"]
+
+    pp_sorted = pp_sorted.iloc[::-1].reset_index(drop=True)
+
+    subplot_specs = [
+        ("cpu_h", "CPU burden (core-h)", "#E63946", "core-h"),
+        ("memory_h", "Memory burden proxy (GB-h)", "#457B9D", "GB-h"),
+        ("total_runtime_hours", "Runtime (h)", "#222222", "h"),
+        ("io_gb", "I/O volume (GB)", "#2A9D8F", "GB"),
+    ]
+
+    fig = make_subplots(
+        rows=1,
+        cols=4,
+        shared_yaxes=True,
+        horizontal_spacing=0.06,
+        subplot_titles=[title for _, title, _, _ in subplot_specs],
+    )
+
+    customdata = np.stack(
+        [
+            pp_sorted["cpu_h"],
+            pp_sorted["memory_h"],
+            pp_sorted["total_runtime_hours"],
+            pp_sorted["io_gb"],
+            pp_sorted["n_tasks"],
+        ],
+        axis=-1,
+    )
+
+    hover_template = (
+        "<b>%{hovertext}</b><br>"
+        "Panel value: %{x:.2f} %{meta}<br>"
+        "CPU burden: %{customdata[0]:.2f} core-h<br>"
+        "Memory burden proxy: %{customdata[1]:.2f} GB-h<br>"
+        "Runtime: %{customdata[2]:.2f} h<br>"
+        "I/O volume: %{customdata[3]:.2f} GB<br>"
+        "Tasks: %{customdata[4]:.0f}<extra></extra>"
+    )
+
+    for col_idx, (metric_col, title, color, unit) in enumerate(subplot_specs, start=1):
+        fig.add_trace(
+            go.Bar(
+                x=pp_sorted[metric_col],
+                y=pp_sorted["process_display"],
+                orientation="h",
+                marker=dict(color=color),
+                hovertext=pp_sorted["process_name"],
+                customdata=customdata,
+                meta=unit,
+                hovertemplate=hover_template,
+                showlegend=False,
+            ),
+            row=1,
+            col=col_idx,
         )
-        bubble_sizes = 10 + 60 * np.sqrt(norm_runtime)
-    else:
-        bubble_sizes = np.full(len(metrics), 40)
+        fig.update_xaxes(title_text=unit, row=1, col=col_idx)
 
-    # Color: time inefficiency
-    time_inefficiency = 100 - metrics["avg_time_efficiency"]
+    fig.update_layout(
+        title=f"Per-Process Resource Burdens — {run_label}<br><sup>Top 12 processes sorted by {plot_cols[sort_by]}</sup>",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=500,
+        bargap=0.2,
+    )
 
-    # Custom hover data
-    custom_data = np.column_stack([
-        metrics["process"],                  # [0] process name
-        metrics["n_tasks"],                  # [1] number of tasks
-        metrics["avg_runtime_hours"],        # [2] avg runtime used
-        metrics["avg_time_requested_hours"], # [3] avg time requested
-        metrics["total_runtime_hours"],      # [4] total runtime
-        metrics["avg_cpus_requested"],       # [5] avg CPU requested
-        metrics["avg_cpus_used"],            # [6] avg CPU used
-        metrics["avg_cpu_efficiency"],       # [7] CPU efficiency %
-        metrics["total_cpu_hours_wasted"],   # [8] CPU-hours wasted
-        metrics["avg_mem_requested_gb"],     # [9] avg mem requested
-        metrics["avg_mem_used_gb"],          # [10] avg mem used
-        metrics["avg_mem_efficiency"],       # [11] mem efficiency %
-        metrics["total_mem_gb_hours_wasted"],# [12] mem GB-hours wasted
-        metrics["avg_time_efficiency"],      # [13] time efficiency %
-        metrics["total_time_hours_wasted"],   # [14] time hours wasted
-    ])
+    fig.update_yaxes(title_text="Process", automargin=True, row=1, col=1)
+
+    return fig
+
+
+
+def _build_process_color_map(processes: List[str]) -> Dict[str, str]:
+    """Assign stable colors to processes across interactive plots."""
+    palette = [
+        "#264653",
+        "#2A9D8F",
+        "#457B9D",
+        "#6D597A",
+        "#E9C46A",
+        "#F4A261",
+        "#E76F51",
+        "#8AB17D",
+        "#5E548E",
+        "#BC4749",
+        "#669BBC",
+        "#A3B18A",
+        "#B56576",
+        "#3D5A80",
+        "#7F5539",
+        "#588157",
+    ]
+    return {proc: palette[i % len(palette)] for i, proc in enumerate(processes)}
+
+
+def create_process_scaling_explorer(
+    process_df: pd.DataFrame,
+    run_summary_df: pd.DataFrame,
+    group_name: str,
+    top_n: int = 15,
+) -> go.Figure | None:
+    """Create an interactive per-group scaling explorer for consistent processes."""
+    group_process_df = process_df[
+        (process_df["group"] == group_name) & (process_df["is_consistent"])
+    ].copy()
+
+    if group_process_df.empty:
+        return None
+
+    group_run_df = run_summary_df[run_summary_df["group"] == group_name].copy()
+    group_labels = group_run_df["label"].tolist()
+
+    long_df = group_process_df.copy()
+    long_df["run_label"] = long_df["label"]
+    run_order = {label: idx for idx, label in enumerate(group_labels)}
+    long_df["run_idx"] = long_df["run_label"].map(run_order)
+
+    resource_config = [
+        ("CPU", "cpu_h", "CPU burden (core-h)", "core-h", "#E63946"),
+        (
+            "Memory",
+            "memory_h",
+            "Memory burden proxy (GB-h)",
+            "GB-h",
+            "#457B9D",
+        ),
+        ("Runtime", "total_runtime_hours", "Runtime (h)", "h", "#1D3557"),
+        ("I/O", "io_gb", "I/O volume (GB)", "GB", "#2A9D8F"),
+    ]
+
+    top_processes_by_resource = {}
+    ordered_processes: List[str] = []
+    for resource_name, metric_col, _, _, _ in resource_config:
+        top_processes = (
+            long_df.groupby("process")[metric_col]
+            .sum()
+            .nlargest(top_n)
+            .index.tolist()
+        )
+        top_processes_by_resource[resource_name] = top_processes
+        ordered_processes.extend(top_processes)
+
+    all_processes = list(dict.fromkeys(ordered_processes))
+    process_colors = _build_process_color_map(all_processes)
+    process_display = (
+        long_df.sort_values("run_idx")
+        .drop_duplicates("process")
+        .set_index("process")["process_display"]
+        .to_dict()
+    )
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=metrics["total_cpu_hours_wasted"],
-            y=metrics["total_mem_gb_hours_wasted"],
-            mode="markers",
-            marker=dict(
-                size=bubble_sizes,
-                sizemode="diameter",
-                color=time_inefficiency,
-                colorscale="RdYlGn_r",
-                cmin=0,
-                cmax=100,
-                opacity=0.85,
-                line=dict(width=1.5, color="white"),
-                colorbar=dict(title="Time inefficiency (%)", thickness=16, len=0.7, x=1.02)
-            ),
-            hovertext=metrics["process_display"],
-            customdata=custom_data,
-            hovertemplate=(
-                "<b>%{hovertext}</b><br><br>"
-                "Tasks: %{customdata[1]}<br>"
-                "Total runtime (sum): %{customdata[4]:.2f} h<br><br>"
-                "<b>CPU (avg per task):</b> %{customdata[6]:.2f} used / %{customdata[5]:.2f} requested | Efficiency: %{customdata[7]:.1f}%<br>"
-                "<b>Memory (avg per task):</b> %{customdata[10]:.2f} used / %{customdata[9]:.2f} requested | Efficiency: %{customdata[11]:.1f}%<br>"
-                "<b>Time (avg per task):</b> %{customdata[2]:.2f} used / %{customdata[3]:.2f} requested | Efficiency: %{customdata[13]:.1f}%<br><br>"
-                "<b>CPU wasted (total):</b> %{x:.2f} core-h<br>"
-                "<b>Memory wasted (total):</b> %{y:.2f} GB·h<br>"
-                "<b>Time wasted (total):</b> %{customdata[14]:.2f} h"
-                "<extra></extra>"
-            ),
-            name="Processes"
+    trace_ranges: Dict[str, Tuple[int, int]] = {}
+
+    for resource_name, metric_col, y_title, unit, accent_color in resource_config:
+        start = len(fig.data)
+        for proc in top_processes_by_resource[resource_name]:
+            subset = long_df[long_df["process"] == proc].sort_values("run_idx")
+            if subset.empty:
+                continue
+
+            display_name = process_display.get(proc, proc)
+            customdata = np.stack(
+                [
+                    subset["cpu_h"],
+                    subset["memory_h"],
+                    subset["total_runtime_hours"],
+                    subset["io_gb"],
+                    subset["run_label"],
+                    subset["n_tasks"],
+                ],
+                axis=-1,
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=subset["run_label"],
+                    y=subset[metric_col],
+                    mode="lines+markers",
+                    name=display_name,
+                    legendgroup=proc,
+                    showlegend=True,
+                    customdata=customdata,
+                    hovertemplate=(
+                        f"<b>{display_name}</b><br>"
+                        "<i>%{customdata[4]}</i><br><br>"
+                        f"<span style='color:{accent_color}'><b>{resource_name}</b></span>: "
+                        f"%{{y:.3f}} {unit}<br>"
+                        "CPU burden: %{customdata[0]:.3f} core-h<br>"
+                        "Memory burden proxy: %{customdata[1]:.3f} GB-h<br>"
+                        "Runtime: %{customdata[2]:.3f} h<br>"
+                        "I/O volume: %{customdata[3]:.3f} GB<br>"
+                        "Tasks: %{customdata[5]:.0f}<extra></extra>"
+                    ),
+                    marker=dict(
+                        size=8,
+                        color=process_colors.get(proc, "#6C757D"),
+                        line=dict(width=1.5, color="white"),
+                    ),
+                    line=dict(
+                        width=2.5,
+                        color=process_colors.get(proc, "#6C757D"),
+                        shape="spline",
+                        smoothing=0.35,
+                    ),
+                    visible=resource_name == "CPU",
+                )
+            )
+
+        trace_ranges[resource_name] = (start, len(fig.data))
+
+    total_traces = len(fig.data)
+
+    def _visible_traces(active_resource: str) -> List[bool]:
+        visibility = [False] * total_traces
+        start, end = trace_ranges[active_resource]
+        for idx in range(start, end):
+            visibility[idx] = True
+        return visibility
+
+    buttons = [
+        dict(
+            label=resource_name,
+            method="update",
+            args=[
+                {"visible": _visible_traces(resource_name)},
+                {
+                    "yaxis.title.text": y_title,
+                    "title.text": (
+                        f"Process Scaling Explorer — {group_name}"
+                        f"<br><sup>Top {top_n} consistent processes ranked by {resource_name}</sup>"
+                    ),
+                },
+            ],
         )
-    )
+        for resource_name, _, y_title, _, _ in resource_config
+    ]
 
     fig.update_layout(
         title=dict(
-            text=f"{title}<br><sub>Bubble size = Total runtime | Color = Time inefficiency</sub>",
-            x=0.5, xanchor="center"
-        ),
-        xaxis=dict(title="Total CPU-hours wasted", showgrid=True, gridcolor="lightgray"),
-        yaxis=dict(title="Total Memory GB-hours wasted", showgrid=True, gridcolor="lightgray"),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        hovermode="closest",
-        width=1000,
-        height=500,
-        showlegend=False,
-    )
-
-    fig.add_annotation(
-        text="Top-right, large, red = highest-priority for optimisation",
-        xref="paper", yref="paper",
-        x=0.99, y=0.98, showarrow=False,
-        xanchor="right", yanchor="top",
-        font=dict(size=11, color="darkred"),
-        bgcolor="rgba(255,255,255,0.85)",
-        bordercolor="darkred",
-        borderwidth=1
-    )
-
-    return fig
-
-# =========================================================
-# 🔹 1. Efficiency overview (bar chart)
-# =========================================================
-
-
-# -------------------------------
-# 1️⃣ Function to create bar chart
-# -------------------------------
-
-def calculate_optimization_priority(
-    metrics, 
-    weight_runtime=0.25,
-    weight_inefficiency=0.3,
-    weight_cpu_demand=0.15,
-    weight_mem_demand=0.15,
-    weight_time_demand=0.15
-):
-    """
-    Calculate optimization priority score for each process.
-    
-    Higher score = better optimization target
-    
-    Parameters:
-    -----------
-    metrics : DataFrame
-        Process metrics data
-    weight_runtime : float (default 0.25)
-        Weight for total runtime impact (cumulative time across all jobs)
-    weight_inefficiency : float (default 0.3)
-        Weight for resource inefficiency (0-1)
-    weight_cpu_demand : float (default 0.15)
-        Weight for CPU resource demand (0-1)
-    weight_mem_demand : float (default 0.15)
-        Weight for memory resource demand (0-1)
-    weight_time_demand : float (default 0.15)
-        Weight for walltime/duration demand per job (0-1)
-    
-    Note: Weights should sum to 1.0
-    
-    Returns:
-    --------
-    DataFrame with added columns:
-        - optimization_priority: Score from 0-100
-        - priority_rank: Ranking (1 = highest priority)
-    """
-    # Validate weights
-    total_weight = (weight_runtime + weight_inefficiency + weight_cpu_demand + 
-                   weight_mem_demand + weight_time_demand)
-    if not (0.99 <= total_weight <= 1.01):
-        print(f"Warning: Weights sum to {total_weight:.3f}, not 1.0. Normalizing...")
-        weight_runtime /= total_weight
-        weight_inefficiency /= total_weight
-        weight_cpu_demand /= total_weight
-        weight_mem_demand /= total_weight
-        weight_time_demand /= total_weight
-    
-    metrics = metrics.copy()
-    
-    # 1. Normalize total runtime (cumulative hours across all jobs) (0-100 scale)
-    if metrics["total_runtime_hours"].max() > 0:
-        runtime_norm = (metrics["total_runtime_hours"] / metrics["total_runtime_hours"].max()) * 100
-    else:
-        runtime_norm = 0
-    
-    # 2. Calculate average inefficiency (inverse of efficiency)
-    avg_efficiency = (
-        metrics["avg_cpu_efficiency"] + 
-        metrics["avg_mem_efficiency"] + 
-        metrics["avg_time_efficiency"]
-    ) / 3
-    inefficiency_score = 100 - avg_efficiency
-    
-    # 3. Normalize CPU demand (0-100 scale)
-    if metrics["avg_cpus_used"].max() > 0:
-        cpu_demand_norm = (metrics["avg_cpus_used"] / metrics["avg_cpus_used"].max()) * 100
-    else:
-        cpu_demand_norm = 0
-    
-    # 4. Normalize memory demand (0-100 scale)
-    if metrics["avg_mem_used_gb"].max() > 0:
-        mem_demand_norm = (metrics["avg_mem_used_gb"] / metrics["avg_mem_used_gb"].max()) * 100
-    else:
-        mem_demand_norm = 0
-    
-    # 5. Normalize time/walltime demand (average job duration) (0-100 scale)
-    if metrics["avg_runtime_hours"].max() > 0:
-        time_demand_norm = (metrics["avg_runtime_hours"] / metrics["avg_runtime_hours"].max()) * 100
-    else:
-        time_demand_norm = 0
-    
-    # 6. Calculate weighted priority score
-    priority_score = (
-        weight_runtime * runtime_norm +
-        weight_inefficiency * inefficiency_score +
-        weight_cpu_demand * cpu_demand_norm +
-        weight_mem_demand * mem_demand_norm +
-        weight_time_demand * time_demand_norm
-    )
-    
-    metrics["optimization_priority"] = priority_score
-    metrics["priority_rank"] = metrics["optimization_priority"].rank(
-        ascending=False, method="dense"
-    ).astype(int)
-    
-    # Store component scores for analysis
-    metrics["_runtime_component"] = weight_runtime * runtime_norm
-    metrics["_inefficiency_component"] = weight_inefficiency * inefficiency_score
-    metrics["_cpu_demand_component"] = weight_cpu_demand * cpu_demand_norm
-    metrics["_mem_demand_component"] = weight_mem_demand * mem_demand_norm
-    metrics["_time_demand_component"] = weight_time_demand * time_demand_norm
-    
-    return metrics
-
-def create_optimization_priority_plot(metrics):
-    """
-    Interactive bar chart showing optimization priority scores with adjustable weight sliders.
-    
-    Parameters:
-    -----------
-    metrics : DataFrame
-        Process metrics data with efficiency and resource usage columns
-    
-    Returns:
-    --------
-    plotly.graph_objects.Figure
-        Interactive figure with weight sliders
-    """
-    
-    # Default weights
-    DEFAULT_WEIGHTS = {
-        'runtime': 0.25,
-        'inefficiency': 0.30,
-        'cpu_demand': 0.15,
-        'mem_demand': 0.15,
-        'time_demand': 0.15
-    }
-    
-    def _calculate_priority_scores(metrics, weights):
-        """Calculate priority scores with given weights."""
-        metrics = metrics.copy()
-        
-        # 1. Normalize total runtime (0-100)
-        runtime_norm = (metrics["total_runtime_hours"] / metrics["total_runtime_hours"].max()) * 100 \
-            if metrics["total_runtime_hours"].max() > 0 else 0
-        
-        # 2. Calculate inefficiency (inverse of avg efficiency)
-        avg_efficiency = (
-            metrics["avg_cpu_efficiency"] + 
-            metrics["avg_mem_efficiency"] + 
-            metrics["avg_time_efficiency"]
-        ) / 3
-        inefficiency_score = 100 - avg_efficiency
-        
-        # 3. Normalize CPU demand (0-100)
-        cpu_demand_norm = (metrics["avg_cpus_used"] / metrics["avg_cpus_used"].max()) * 100 \
-            if metrics["avg_cpus_used"].max() > 0 else 0
-        
-        # 4. Normalize memory demand (0-100)
-        mem_demand_norm = (metrics["avg_mem_used_gb"] / metrics["avg_mem_used_gb"].max()) * 100 \
-            if metrics["avg_mem_used_gb"].max() > 0 else 0
-        
-        # 5. Normalize time demand (avg job duration) (0-100)
-        time_demand_norm = (metrics["avg_runtime_hours"] / metrics["avg_runtime_hours"].max()) * 100 \
-            if metrics["avg_runtime_hours"].max() > 0 else 0
-        
-        # 6. Calculate weighted priority score
-        priority_score = (
-            weights['runtime'] * runtime_norm +
-            weights['inefficiency'] * inefficiency_score +
-            weights['cpu_demand'] * cpu_demand_norm +
-            weights['mem_demand'] * mem_demand_norm +
-            weights['time_demand'] * time_demand_norm
-        )
-        
-        # Store components for hover info
-        metrics["optimization_priority"] = priority_score
-        metrics["_runtime_component"] = weights['runtime'] * runtime_norm
-        metrics["_inefficiency_component"] = weights['inefficiency'] * inefficiency_score
-        metrics["_cpu_demand_component"] = weights['cpu_demand'] * cpu_demand_norm
-        metrics["_mem_demand_component"] = weights['mem_demand'] * mem_demand_norm
-        metrics["_time_demand_component"] = weights['time_demand'] * time_demand_norm
-        
-        # Also store normalized values for hover
-        metrics["_runtime_norm"] = runtime_norm
-        metrics["_inefficiency_score"] = inefficiency_score
-        metrics["_cpu_demand_norm"] = cpu_demand_norm
-        metrics["_mem_demand_norm"] = mem_demand_norm
-        metrics["_time_demand_norm"] = time_demand_norm
-        
-        return metrics
-    
-    # Create weight combinations for slider steps
-    # We'll create frames for different weight combinations
-    weight_steps = []
-    
-    # Generate reasonable weight variations (0.0 to 0.5 in steps of 0.05)
-    weight_values = [i * 0.05 for i in range(11)]  # 0.0, 0.05, ..., 0.50
-    
-    # For simplicity, create frames for each individual weight slider
-    # Each frame will adjust one weight and redistribute others proportionally
-    
-    # Calculate initial scores
-    metrics_default = _calculate_priority_scores(metrics, DEFAULT_WEIGHTS)
-    metrics_sorted = metrics_default.sort_values("optimization_priority", ascending=False).head(15)
-    
-    # Create the base figure
-    fig = go.Figure()
-    
-    # Add main priority bar
-    fig.add_trace(
-        go.Bar(
-            x=metrics_sorted["process"],
-            y=metrics_sorted["optimization_priority"],
-            name="Optimization Priority",
-            marker=dict(color="#1f77b4"),
-            hovertext=metrics_sorted["process_display"],
-            customdata=metrics_sorted[[
-                "_runtime_component", "_runtime_norm",
-                "_inefficiency_component", "_inefficiency_score",
-                "_cpu_demand_component", "_cpu_demand_norm",
-                "_mem_demand_component", "_mem_demand_norm",
-                "_time_demand_component", "_time_demand_norm",
-                "total_runtime_hours", "avg_cpus_used", "avg_mem_used_gb",
-                "avg_runtime_hours", "n_tasks"
-            ]].values,
-            hovertemplate=(
-                "<b>%{hovertext}</b><br>"
-                "Priority Score: %{y:.1f}<br><br>"
-                "<b>Score Components:</b><br>"
-                "Runtime: %{customdata[0]:.1f} (norm: %{customdata[1]:.1f})<br>"
-                "Inefficiency: %{customdata[2]:.1f} (score: %{customdata[3]:.1f})<br>"
-                "CPU Demand: %{customdata[4]:.1f} (norm: %{customdata[5]:.1f})<br>"
-                "Mem Demand: %{customdata[6]:.1f} (norm: %{customdata[7]:.1f})<br>"
-                "Time Demand: %{customdata[8]:.1f} (norm: %{customdata[9]:.1f})<br><br>"
-                "<b>Actual Values:</b><br>"
-                "Total Runtime: %{customdata[10]:.1f} h<br>"
-                "Avg CPUs: %{customdata[11]:.2f} cores<br>"
-                "Avg Mem: %{customdata[12]:.2f} GB<br>"
-                "Avg Job Time: %{customdata[13]:.2f} h<br>"
-                "Tasks: %{customdata[14]:.0f}"
-                "<extra></extra>"
+            text=(
+                f"Process Scaling Explorer — {group_name}"
+                f"<br><sup>Top {top_n} consistent processes ranked by CPU</sup>"
             ),
-        )
-    )
-    
-    # Create frames for weight variations
-    frames = []
-    slider_steps = []
-    
-    # We'll create a combined slider that varies all weights together
-    # This is a simplified approach - you could create 5 separate sliders if needed
-    num_steps = 21  # Number of slider positions
-    
-    for step_idx in range(num_steps):
-        # Interpolate weights based on slider position
-        # At step 0: default weights
-        # At other steps: emphasize different components
-        
-        # Simple approach: vary one weight at a time in cycles
-        component_idx = (step_idx // 5) % 5
-        component_names = ['runtime', 'inefficiency', 'cpu_demand', 'mem_demand', 'time_demand']
-        
-        # Create weight variation
-        if step_idx == 0:
-            weights = DEFAULT_WEIGHTS.copy()
-            label = "Default (balanced)"
-        else:
-            weights = DEFAULT_WEIGHTS.copy()
-            varied_component = component_names[component_idx]
-            
-            # Increase the selected component, decrease others
-            variation = (step_idx % 5) * 0.05
-            weights[varied_component] = min(0.5, DEFAULT_WEIGHTS[varied_component] + variation)
-            
-            # Redistribute remaining weight
-            other_components = [c for c in component_names if c != varied_component]
-            remaining_weight = 1.0 - weights[varied_component]
-            for comp in other_components:
-                weights[comp] = remaining_weight / len(other_components)
-            
-            label = f"{varied_component.replace('_', ' ').title()} +{variation:.2f}"
-        
-        # Calculate scores with these weights
-        metrics_step = _calculate_priority_scores(metrics, weights)
-        metrics_step_sorted = metrics_step.sort_values("optimization_priority", ascending=False).head(15)
-        
-        # Create frame
-        frame_data = go.Bar(
-            x=metrics_step_sorted["process"],
-            y=metrics_step_sorted["optimization_priority"],
-            name="Optimization Priority",
-            marker=dict(color="#1f77b4"),
-            hovertext=metrics_step_sorted["process_display"],
-            customdata=metrics_step_sorted[[
-                "_runtime_component", "_runtime_norm",
-                "_inefficiency_component", "_inefficiency_score",
-                "_cpu_demand_component", "_cpu_demand_norm",
-                "_mem_demand_component", "_mem_demand_norm",
-                "_time_demand_component", "_time_demand_norm",
-                "total_runtime_hours", "avg_cpus_used", "avg_mem_used_gb",
-                "avg_runtime_hours", "n_tasks"
-            ]].values,
-            hovertemplate=(
-                "<b>%{hovertext}</b><br>"
-                "Priority Score: %{y:.1f}<br><br>"
-                "<b>Score Components:</b><br>"
-                "Runtime: %{customdata[0]:.1f} (norm: %{customdata[1]:.1f})<br>"
-                "Inefficiency: %{customdata[2]:.1f} (score: %{customdata[3]:.1f})<br>"
-                "CPU Demand: %{customdata[4]:.1f} (norm: %{customdata[5]:.1f})<br>"
-                "Mem Demand: %{customdata[6]:.1f} (norm: %{customdata[7]:.1f})<br>"
-                "Time Demand: %{customdata[8]:.1f} (norm: %{customdata[9]:.1f})<br><br>"
-                f"<b>Weights:</b> R:{weights['runtime']:.2f} I:{weights['inefficiency']:.2f} "
-                f"C:{weights['cpu_demand']:.2f} M:{weights['mem_demand']:.2f} T:{weights['time_demand']:.2f}<br><br>"
-                "<b>Actual Values:</b><br>"
-                "Total Runtime: %{customdata[10]:.1f} h<br>"
-                "Avg CPUs: %{customdata[11]:.2f} cores<br>"
-                "Avg Mem: %{customdata[12]:.2f} GB<br>"
-                "Avg Job Time: %{customdata[13]:.2f} h<br>"
-                "Tasks: %{customdata[14]:.0f}"
-                "<extra></extra>"
-            ),
-        )
-        
-        frames.append(go.Frame(data=[frame_data], name=str(step_idx)))
-        slider_steps.append({
-            "args": [[str(step_idx)], {
-                "frame": {"duration": 0, "redraw": True},
-                "mode": "immediate",
-                "transition": {"duration": 0}
-            }],
-            "label": label,
-            "method": "animate"
-        })
-    
-    fig.frames = frames
-    
-    # Layout
-    fig.update_layout(
-        title="Optimization Priority Ranking (Interactive Weight Adjustment)",
-        xaxis_title="Process",
-        yaxis=dict(title="Priority Score (0-100)"),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        autosize=True,
-        legend=dict(
-            orientation="v",
-            yanchor="top",
-            y=1.0,
+            x=0.01,
             xanchor="left",
-            x=1.02,
-            font=dict(size=12),
-            bgcolor="rgba(255,255,255,0.95)",
-            bordercolor="#ccc",
-            borderwidth=1,
-        ),
-        sliders=[{
-            "active": 0,
-            "yanchor": "top",
-            "y": -0.2,
-            "xanchor": "left",
-            "currentvalue": {
-                "prefix": "Weight Profile: ",
-                "visible": True,
-                "xanchor": "left"
-            },
-            "pad": {"b": 10, "t": 50},
-            "len": 0.9,
-            "x": 0.05,
-            "steps": slider_steps
-        }]
-    )
-    
-    # Set x-axis labels
-    label_map = dict(zip(metrics_sorted["process"], metrics_sorted["process_display"]))
-    fig.update_xaxes(
-        tickmode="array",
-        tickvals=list(label_map.keys()),
-        ticktext=list(label_map.values()),
-        automargin=True,
-    )
-    
-    return fig
-
-def create_efficiency_dashboard(
-    metrics, 
-    sort_by="optimization_priority",
-    weight_runtime=0.25,
-    weight_inefficiency=0.3,
-    weight_cpu_demand=0.15,
-    weight_mem_demand=0.15,
-    weight_time_demand=0.15,
-    show_top_n=15
-):
-    """
-    Two-panel dashboard with optimization priority.
-    
-    sort_by options:
-      - 'avg_cpu_efficiency'
-      - 'avg_mem_efficiency'
-      - 'avg_time_efficiency'
-      - 'efficiency_sum'
-      - 'total_runtime_hours'
-      - 'optimization_priority' (recommended!)
-    """
-    # Calculate optimization priority
-    metrics = calculate_optimization_priority(
-        metrics,
-        weight_runtime=weight_runtime,
-        weight_inefficiency=weight_inefficiency,
-        weight_cpu_demand=weight_cpu_demand,
-        weight_mem_demand=weight_mem_demand,
-        weight_time_demand=weight_time_demand
-    )
-    
-    # Compute efficiency sum if needed
-    if sort_by == "efficiency_sum":
-        metrics["efficiency_sum"] = (
-            metrics["avg_cpu_efficiency"]
-            + metrics["avg_mem_efficiency"]
-            + metrics["avg_time_efficiency"]
-        )
-        sort_by_col = "efficiency_sum"
-    else:
-        sort_by_col = sort_by
-    
-    # Sort by priority (descending for priority, ascending for efficiency)
-    if sort_by == "optimization_priority":
-        metrics_sorted = metrics.sort_values(sort_by_col, ascending=False)
-    else:
-        metrics_sorted = metrics.sort_values(sort_by_col, ascending=True)
-    
-    metrics_sorted = metrics_sorted.head(show_top_n)
-    
-    # Melt for bar plotting
-    df_melt = metrics_sorted.melt(
-        id_vars=["process", "process_display", "total_runtime_hours", "optimization_priority"],
-        value_vars=["avg_cpu_efficiency", "avg_mem_efficiency", "avg_time_efficiency"],
-        var_name="metric",
-        value_name="efficiency",
-    )
-    
-    fig = make_subplots(
-        rows=2, cols=1,
-        row_heights=[0.6, 0.4],
-        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
-        subplot_titles=(
-            f"Process Efficiency & Runtime (sorted by {sort_by})",
-            "Absolute Resource Usage & Priority Breakdown"
-        ),
-        vertical_spacing=0.12
-    )
-    
-    # === TOP PANEL: Efficiency bars ===
-    for metric_name, df_metric in df_melt.groupby("metric"):
-        fig.add_trace(
-            go.Bar(
-                x=df_metric["process"],
-                y=df_metric["efficiency"],
-                name=metric_name.replace("avg_", "").replace("_", " ").title(),
-                hovertext=df_metric["process_display"],
-                hovertemplate="<b>%{hovertext}</b><br>Efficiency: %{y:.1f}%<extra></extra>",
-                legendgroup="efficiency",
-            ),
-            row=1, col=1, secondary_y=False
-        )
-    
-    # Runtime line
-    fig.add_trace(
-        go.Scatter(
-            x=metrics_sorted["process"],
-            y=metrics_sorted["total_runtime_hours"],
-            name="Total Runtime (h)",
-            mode="lines+markers",
-            line=dict(color="black", width=2, dash="dot"),
-            marker=dict(size=6),
-            hovertext=metrics_sorted["process_display"],
-            hovertemplate="<b>%{hovertext}</b><br>Runtime: %{y:.1f} h<extra></extra>",
-            legendgroup="runtime",
-        ),
-        row=1, col=1, secondary_y=True
-    )
-    
-    # Optimization priority markers (on primary y-axis as reference)
-    fig.add_trace(
-        go.Scatter(
-            x=metrics_sorted["process"],
-            y=metrics_sorted["optimization_priority"],
-            name="Optimization Priority",
-            mode="markers",
-            marker=dict(
-                size=12,
-                color=metrics_sorted["optimization_priority"],
-                colorscale="RdYlGn_r",  # Red = high priority, Green = low
-                showscale=True,
-                colorbar=dict(
-                    title="Priority<br>Score",
-                    x=1.15,
-                    len=0.3,
-                    y=0.8
-                ),
-                line=dict(width=1, color="black")
-            ),
-            hovertext=metrics_sorted["process_display"],
-            hovertemplate="<b>%{hovertext}</b><br>Priority Score: %{y:.1f}<extra></extra>",
-            legendgroup="priority",
-            yaxis="y3"
-        ),
-        row=1, col=1
-    )
-    
-    # === BOTTOM PANEL: Absolute usage for top priority process ===
-    top_process = metrics_sorted.iloc[0]
-    
-    # Resource usage metrics (now including all three demands)
-    usage_labels = ["CPU (cores)", "Memory (GB)", "Walltime (h)"]
-    usage_values = [
-        top_process["avg_cpus_used"],
-        top_process["avg_mem_used_gb"],
-        top_process["avg_runtime_hours"]
-    ]
-    
-    fig.add_trace(
-        go.Bar(
-            x=usage_labels,
-            y=usage_values,
-            name="Avg Resource Usage",
-            marker_color=["#1f77b4", "#ff7f0e", "#2ca02c"],
-            text=[f"{v:.2f}" for v in usage_values],
-            textposition="outside",
-            hovertemplate="<b>%{x}</b><br>%{y:.2f}<extra></extra>",
-            showlegend=False,
-        ),
-        row=2, col=1
-    )
-    
-    # Add priority score breakdown as annotations
-    priority_breakdown = [
-        f"Total Runtime: {top_process['_runtime_component']:.1f}",
-        f"Inefficiency: {top_process['_inefficiency_component']:.1f}",
-        f"CPU Demand: {top_process['_cpu_demand_component']:.1f}",
-        f"Mem Demand: {top_process['_mem_demand_component']:.1f}",
-        f"Time Demand: {top_process['_time_demand_component']:.1f}",
-    ]
-    
-    # Layout
-    fig.update_layout(
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        autosize=True,
-        width=1200,
-        height=900,
-        barmode="group",
-        hovermode="closest",
-        legend=dict(
-            orientation="v",
+            y=0.95,
             yanchor="top",
-            y=0.98,
-            xanchor="left",
-            x=1.02,
-            font=dict(size=11),
-            bgcolor="rgba(255,255,255,0.95)",
-            bordercolor="#ccc",
-            borderwidth=1,
         ),
-        annotations=[
+        updatemenus=[
             dict(
-                text=f"<b>Top Priority: {top_process['process_display']}</b><br>" +
-                     f"Total Score: {top_process['optimization_priority']:.1f}<br>" +
-                     "<br>".join(priority_breakdown),
-                xref="paper", yref="paper",
-                x=0.02, y=0.35,
-                showarrow=False,
-                bgcolor="rgba(255,255,200,0.8)",
-                bordercolor="black",
+                type="buttons",
+                direction="right",
+                x=0.01,
+                xanchor="left",
+                y=1.10,
+                yanchor="bottom",
+                pad=dict(r=8, t=6, b=0),
+                buttons=buttons,
+                showactive=True,
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor="#D9E2EC",
                 borderwidth=1,
-                font=dict(size=10),
-                align="left"
+                font=dict(size=12, color="#243B53"),
+                active=0,
             )
-        ]
-    )
-    
-    # Add third y-axis for priority scores
-    fig.update_layout(
-        yaxis3=dict(
-            title="Priority Score",
-            overlaying="y",
-            side="right",
-            position=0.95,
-            showgrid=False,
-            range=[0, 100]
-        )
-    )
-    
-    # Update axes
-    fig.update_xaxes(title_text="Process", row=1, col=1)
-    fig.update_yaxes(title_text="Efficiency (%)", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Runtime (h)", row=1, col=1, secondary_y=True)
-    fig.update_xaxes(title_text="Resource Metric", row=2, col=1)
-    fig.update_yaxes(title_text="Average Usage per Job", row=2, col=1)
-    
-    # Use display labels on x-axis
-    label_map = dict(zip(metrics_sorted["process"], metrics_sorted["process_display"]))
-    fig.update_xaxes(
-        tickmode="array",
-        tickvals=list(label_map.keys()),
-        ticktext=list(label_map.values()),
-        automargin=True,
-        row=1, col=1
-    )
-    
-    return fig
-
-
-
-def create_process_composition_plot(pp, run_label, sort_by):
-    """Plotly version of per-process resource composition."""
-
-    # Sort + select top N
-    pp_sorted = pp.sort_values(sort_by, ascending=False).head(12)
-
-    fig = go.Figure()
-
-    resources = [
-        ("cpu_h_mean", "cpu_h_std", "CPU", "(core usage x runtime)"),
-        ("memory_h_mean", "memory_h_std", "Memory", "(peak RSS x runtime)"),
-        ("io_h_mean", "io_h_std", "I/O", "(I/O operations x runtime)"),
-    ]
-    
-    customdata = np.stack(
-        [
-            pp_sorted["total_runtime_hours"],   
-            pp_sorted["n_tasks"],               
         ],
-        axis=-1
-    )
-    
-    # --- Bars (CPU / Memory / I/O) ---
-    for res_col, std_col, label, calc in resources:
-        fig.add_trace(
-            go.Bar(
-                x=pp_sorted["process"],
-                y=pp_sorted[res_col],
-                name=label + " " + calc,
-                error_y=dict(
-                    type="data",
-                    array=pp_sorted[std_col],
-                    visible=True,
-                ),
-                customdata=customdata,
-                hovertext=pp_sorted["process_name"],
-                hovertemplate=(
-                    "<b>%{hovertext}</b><br>"
-                    f"{label}-hours: %{{y:.2f}} h ± %{{error_y.array:.2f}} h<br>"
-                    "Total process runtime: %{customdata[0]:.2f} h<br>"
-                    "Tasks: %{customdata[1]}<extra></extra>"
-                ),
-            )
-        )
-
-    # --- Runtime line ---
-    if "total_runtime_hours" in pp_sorted.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=pp_sorted["process"],
-                y=pp_sorted["total_runtime_hours"],
-                name="Total Runtime (h)",
-                yaxis="y2",
-                mode="lines+markers",
-                line=dict(color="black", width=2, dash="dot"),
-                marker=dict(size=6),
-                hovertext=pp_sorted["process_name"],
-                hovertemplate="<b>%{hovertext}</b><br>Runtime: %{y:.2f} h<extra></extra>",
-            )
-        )
-
-    # --- Layout ---
-    fig.update_layout(
-        title=f"Avg. Per Process Resource Contribution (± std) — {run_label}",
-        xaxis_title="Process",
-        yaxis=dict(title="Resource (hours)"),
-        yaxis2=dict(
-            title="Runtime (h)",
-            overlaying="y",
-            side="right",
+        xaxis=dict(
+            title="Pipeline Run",
+            tickfont=dict(size=11, color="#334E68"),
+            showgrid=False,
+            linecolor="#BCCCDC",
+            linewidth=1,
+            showline=True,
+            ticks="outside",
+            ticklen=5,
         ),
-        barmode="group",
-        plot_bgcolor="white",
+        yaxis=dict(
+            title="CPU burden (core-h)",
+            tickfont=dict(size=10, color="#334E68"),
+            gridcolor="#E6EEF5",
+            gridwidth=1,
+            zeroline=False,
+            linecolor="#BCCCDC",
+            linewidth=1,
+            showline=True,
+        ),
+        hovermode="closest",
+        hoverlabel=dict(
+            bgcolor="rgba(255,255,255,0.98)",
+            bordercolor="#D9E2EC",
+            font=dict(size=11, color="#102A43"),
+            namelength=0,
+        ),
+        height=620,
+        width=1180,
+        plot_bgcolor="#F8FBFD",
         paper_bgcolor="white",
         legend=dict(
-            orientation="v",
-            yanchor="top",
-            y=1.0,
+            title="Process",
+            font=dict(size=10, color="#243B53"),
+            bgcolor="rgba(255,255,255,0.96)",
+            bordercolor="#D9E2EC",
+            borderwidth=1,
+            groupclick="togglegroup",
+            itemsizing="constant",
+            tracegroupgap=2,
+            x=1.02,
             xanchor="left",
-            x=1.2,
+            y=1,
+            yanchor="top",
         ),
-    )
-
-
-    # --- Use display labels ---
-    label_map = dict(zip(pp_sorted["process"], pp_sorted["process_display"]))
-    fig.update_xaxes(
-        tickmode="array",
-        tickvals=list(label_map.keys()),
-        ticktext=list(label_map.values()),
-        automargin=True,
+        margin=dict(t=145, r=240, l=80, b=75),
     )
 
     return fig
-
-
-
-def create_efficiency_bar(metrics, sort_by="overall_efficiency"):
-    """
-    Bar chart of efficiencies with runtime line.
-    
-    sort_by options:
-      - 'avg_cpu_efficiency'
-      - 'avg_mem_efficiency'
-      - 'avg_time_efficiency'
-      - 'efficiency_sum'  → sum of the three
-      - 'total_runtime_hours'
-    """
-    
-    # Configuration for metrics
-    METRIC_CONFIG = {
-        "avg_cpu_efficiency": {
-            "used": "avg_cpus_used",
-            "requested": "avg_cpus_requested",
-            "unit": "cores",
-        },
-        "avg_mem_efficiency": {
-            "used": "avg_mem_used_gb",
-            "requested": "avg_mem_requested_gb",
-            "unit": "GB",
-        },
-        "avg_time_efficiency": {
-            "used": "avg_runtime_hours",
-            "requested": "avg_time_requested_hours",
-            "unit": "h",
-        },
-    }
-    
-    def _prepare_data(metrics, sort_by):
-        """Prepare and sort metrics data."""
-        metrics = metrics.copy()
-        
-        # Compute efficiency sum if needed
-        if sort_by == "efficiency_sum":
-            metrics["efficiency_sum"] = (
-                metrics["avg_cpu_efficiency"]
-                + metrics["avg_mem_efficiency"]
-                + metrics["avg_time_efficiency"]
-            )
-            sort_col = "efficiency_sum"
-        else:
-            sort_col = sort_by
-        
-        # Sort and limit results
-        metrics_sorted = metrics.sort_values(sort_col, ascending=True).head(12)
-        
-        # Ensure display column exists
-        if "process_display" not in metrics_sorted.columns:
-            metrics_sorted["process_display"] = metrics_sorted["process_name"]
-        
-        # Ensure all std columns exist
-        std_cols = [
-            "std_cpu_efficiency", "std_mem_efficiency", "std_time_efficiency",
-            "std_cpus_used", "std_cpus_requested",
-            "std_mem_used_gb", "std_mem_requested_gb",
-            "std_runtime_hours", "std_time_requested_hours"
-        ]
-        for col in std_cols:
-            if col not in metrics_sorted.columns:
-                metrics_sorted[col] = np.nan
-        
-        return metrics_sorted
-    
-    def _melt_metrics(metrics_sorted):
-        """Reshape data for plotting."""
-        id_vars = [
-            "process", "process_name", "process_display", "total_runtime_hours", "n_tasks"
-        ]
-        # Add all avg and std columns as id_vars
-        for metric_name, config in METRIC_CONFIG.items():
-            for resource_type in ["used", "requested"]:
-                col = config[resource_type]
-                id_vars.extend([col, f"std_{col.replace('avg_', '')}"])
-        
-        # Add efficiency std columns
-        id_vars.extend(["std_cpu_efficiency", "std_mem_efficiency", "std_time_efficiency"])
-        
-        return metrics_sorted.melt(
-            id_vars=id_vars,
-            value_vars=list(METRIC_CONFIG.keys()),
-            var_name="metric",
-            value_name="efficiency",
-        )
-    
-    def _add_efficiency_bars(fig, df_melt):
-        """Add efficiency bar traces to figure."""
-        for metric_name, df_metric in df_melt.groupby("metric"):
-            config = METRIC_CONFIG[metric_name]
-            used_col = config["used"]
-            req_col = config["requested"]
-            used_std_col = f"std_{used_col.replace('avg_', '')}"
-            req_std_col = f"std_{req_col.replace('avg_', '')}"
-            eff_std_col = f"std_{metric_name.replace('avg_', '')}"
-            unit = config["unit"]
-            
-            fig.add_trace(
-                go.Bar(
-                    x=df_metric["process"],
-                    y=df_metric["efficiency"],
-                    name=metric_name.replace("avg_", "").replace("_", " ").title(),
-                    hovertext=df_metric["process_display"],
-                    customdata=df_metric[[
-                        used_col, used_std_col, req_col, req_std_col, eff_std_col, "n_tasks"
-                    ]].values,
-                    error_y=dict(
-                        type="data",
-                        array=df_metric[eff_std_col],
-                        visible=True,
-                    ),
-                    hovertemplate=(
-                        "<b>%{hovertext}</b><br>"
-                        f"Efficiency: %{{y:.1f}}% ± %{{customdata[4]:.1f}}%<br>"
-                        f"Used: %{{customdata[0]:.2f}} ± %{{customdata[1]:.2f}} {unit} / "
-                        f"Requested: %{{customdata[2]:.2f}} ± %{{customdata[3]:.2f}} {unit}<br>"
-                        "Tasks: %{customdata[5]:.0f}"
-                        "<extra></extra>"
-                    ),
-                )
-            )
-    
-    def _add_runtime_line(fig, metrics_sorted):
-        """Add runtime line trace to figure."""
-        fig.add_trace(
-            go.Scatter(
-                x=metrics_sorted["process"],
-                y=metrics_sorted["total_runtime_hours"],
-                name="Total Runtime (h)",
-                yaxis="y2",
-                mode="lines+markers",
-                line=dict(color="black", width=2, dash="dot"),
-                marker=dict(size=6),
-                hovertext=metrics_sorted["process_name"],
-                hovertemplate="<b>%{hovertext}</b><br>Total Runtime: %{y:.1f} h<extra></extra>",
-            )
-        )
-    
-    def _configure_layout(fig, metrics_sorted, sort_by):
-        """Configure figure layout."""
-        fig.update_layout(
-            title=f"Process Efficiency & Runtime Overview (sorted by {sort_by})",
-            xaxis_title="Process",
-            yaxis=dict(title="Efficiency (%)"),
-            yaxis2=dict(
-                title="Total Runtime (h)",
-                overlaying="y",
-                side="right",
-            ),
-            barmode="group",
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            autosize=True,
-            legend=dict(
-                orientation="v",
-                yanchor="top",
-                y=1.0,
-                xanchor="left",
-                x=1.2,
-                font=dict(size=12),
-                bgcolor="rgba(255,255,255,0.95)",
-                bordercolor="#ccc",
-                borderwidth=1,
-            ),
-        )
-        
-        # Set x-axis labels
-        label_map = dict(zip(metrics_sorted["process"], metrics_sorted["process_display"]))
-        fig.update_xaxes(
-            tickmode="array",
-            tickvals=list(label_map.keys()),
-            ticktext=list(label_map.values()),
-            automargin=True,
-        )
-    
-    # Main execution flow
-    metrics_sorted = _prepare_data(metrics, sort_by)
-    df_melt = _melt_metrics(metrics_sorted)
-    
-    fig = go.Figure()
-    _add_efficiency_bars(fig, df_melt)
-    _add_runtime_line(fig, metrics_sorted)
-    _configure_layout(fig, metrics_sorted, sort_by)
-    
-    return fig
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-
-from IPython.display import display, clear_output
-from ipywidgets import interact, Dropdown, FloatSlider, IntSlider
 
 
 def create_optimization_priority_plot(
@@ -1677,120 +1149,12 @@ def create_optimization_priority_plot(
             metrics["process_display"] = metrics["process_name"]
         else:
             metrics["process_display"] = metrics["process"]
-
-    # Default weights
-    if impact_weights is None:
-        impact_weights = {
-            "cpu_cost": 0.4,
-            "mem_cost": 0.3,
-            "time_cost": 0.3,
-        }
-
-    if inefficiency_weights is None:
-        inefficiency_weights = {
-            "cpu_ineff": 0.4,
-            "mem_ineff": 0.3,
-            "time_ineff": 0.3,
-        }
-
-    if variability_weights is None:
-        variability_weights = {
-            "runtime_cv": 0.6,
-            "cpu_cv": 0.2,
-            "mem_cv": 0.2,
-        }
-
-    def _normalize(series):
-        series = pd.Series(series).fillna(0)
-        max_val = series.max()
-        if max_val <= 0 or pd.isna(max_val):
-            return pd.Series(np.zeros(len(series)), index=series.index)
-        return series / max_val
-
-    def _safe_cv(mean, std):
-        mean = pd.Series(mean).replace(0, np.nan)
-        std = pd.Series(std).fillna(0)
-        return std / mean
-
-    def _normalize_weight_group(weights):
-        total = sum(weights.values())
-        if total <= 0:
-            n = len(weights)
-            return {k: 1 / n for k in weights}
-        return {k: v / total for k, v in weights.items()}
-
-    impact_weights = _normalize_weight_group(impact_weights)
-    inefficiency_weights = _normalize_weight_group(inefficiency_weights)
-    variability_weights = _normalize_weight_group(variability_weights)
-
-    # ---- Impact ----
-    cpu_cost = metrics["total_runtime_hours"] * metrics["avg_cpus_used"]
-    mem_cost = metrics["total_runtime_hours"] * metrics["avg_mem_used_gb"]
-    time_cost = metrics["total_runtime_hours"]
-
-    cpu_cost_n = _normalize(cpu_cost)
-    mem_cost_n = _normalize(mem_cost)
-    time_cost_n = _normalize(time_cost)
-
-    impact = (
-        impact_weights["cpu_cost"] * cpu_cost_n +
-        impact_weights["mem_cost"] * mem_cost_n +
-        impact_weights["time_cost"] * time_cost_n
+    metrics = add_optimization_priority_columns(
+        metrics,
+        impact_weights=impact_weights,
+        inefficiency_weights=inefficiency_weights,
+        variability_weights=variability_weights,
     )
-
-    # ---- Inefficiency ----
-    cpu_ineff = 1 - metrics["avg_cpu_efficiency"] / 100
-    mem_ineff = 1 - metrics["avg_mem_efficiency"] / 100
-    time_ineff = 1 - metrics["avg_time_efficiency"] / 100
-
-    inefficiency = (
-        inefficiency_weights["cpu_ineff"] * cpu_ineff +
-        inefficiency_weights["mem_ineff"] * mem_ineff +
-        inefficiency_weights["time_ineff"] * time_ineff
-    )
-
-    # ---- Variability ----
-    runtime_cv = _safe_cv(metrics["avg_runtime_hours"], metrics["std_runtime_hours"])
-    cpu_cv = _safe_cv(metrics["avg_cpus_used"], metrics["std_cpus_used"])
-    mem_cv = _safe_cv(metrics["avg_mem_used_gb"], metrics["std_mem_used_gb"])
-
-    runtime_cv_n = _normalize(runtime_cv.fillna(0))
-    cpu_cv_n = _normalize(cpu_cv.fillna(0))
-    mem_cv_n = _normalize(mem_cv.fillna(0))
-
-    variability = (
-        variability_weights["runtime_cv"] * runtime_cv_n +
-        variability_weights["cpu_cv"] * cpu_cv_n +
-        variability_weights["mem_cv"] * mem_cv_n
-    )
-
-    # ---- Final priority ----
-    priority = impact * (inefficiency + variability)
-
-    metrics["priority"] = priority
-    metrics["_impact"] = impact
-    metrics["_inefficiency"] = inefficiency
-    metrics["_variability"] = variability
-
-    metrics["_cpu_cost"] = cpu_cost
-    metrics["_mem_cost"] = mem_cost
-    metrics["_time_cost"] = time_cost
-
-    metrics["_cpu_cost_norm"] = cpu_cost_n
-    metrics["_mem_cost_norm"] = mem_cost_n
-    metrics["_time_cost_norm"] = time_cost_n
-
-    metrics["_cpu_ineff"] = cpu_ineff
-    metrics["_mem_ineff"] = mem_ineff
-    metrics["_time_ineff"] = time_ineff
-
-    metrics["_runtime_cv"] = runtime_cv
-    metrics["_cpu_cv"] = cpu_cv
-    metrics["_mem_cv"] = mem_cv
-
-    metrics["_runtime_cv_norm"] = runtime_cv_n
-    metrics["_cpu_cv_norm"] = cpu_cv_n
-    metrics["_mem_cv_norm"] = mem_cv_n
 
     df = metrics.sort_values("priority", ascending=False).head(top_n)
 
@@ -1820,8 +1184,8 @@ def create_optimization_priority_plot(
                 "Variability: %{customdata[2]:.3f}<br><br>"
 
                 "<b>Impact details</b><br>"
-                "CPU cost: %{customdata[3]:.2f} (norm: %{customdata[6]:.2f})<br>"
-                "MEM cost: %{customdata[4]:.2f} (norm: %{customdata[7]:.2f})<br>"
+                "CPU cost: %{customdata[3]:.2f} core-h (norm: %{customdata[6]:.2f})<br>"
+                "MEM cost: %{customdata[4]:.2f} GB-h (norm: %{customdata[7]:.2f})<br>"
                 "TIME cost: %{customdata[5]:.2f} h (norm: %{customdata[8]:.2f})<br><br>"
 
                 "<b>Inefficiency details</b><br>"
