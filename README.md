@@ -1,6 +1,10 @@
-# Nextflow Trace Resource Analysis
+# Nextflow Pipeline Resource Analysis
 
-Notebook for exploring resource usage of **Nextflow trace files (raw format)** to optimize CPU and memory requests.
+Interactive notebook for analyzing and comparing Nextflow pipeline runs. Load trace files to identify resource optimization opportunities with three complementary dashboards:
+
+- **Optimization Priority Ranking** — Score processes by impact, inefficiency, and variability to find the best tuning targets
+- **Resource Burden Views** — Compare CPU, memory, runtime, and I/O contribution across processes
+- **Scaling Explorer** — Track how consistent processes scale across different runs
 
 ## Setup
 
@@ -8,7 +12,7 @@ This project uses **uv** for reproducible environments.
 
 ```bash
 git clone <repo-url>
-cd nf-trace-analysis
+cd workflow_optimization
 uv sync
 ```
 
@@ -20,17 +24,24 @@ uv run jupyter notebook
 
 Open:
 ```
-notebooks/trace_analysis.ipynb
+notebooks/Resource Contribution Scaling Analysis.ipynb
 ```
 
 Select the `.venv` kernel if prompted.
 
-## Required Nextflow trace config (raw)
+## Required Nextflow trace config
+
+Add this to your `nextflow.config` to generate compatible trace files:
 
 ```groovy
 trace {
   enabled = true
   raw = true
-  fields = "process,task_id,name,status,cpus,memory,realtime,%cpu,peak_rss,read_bytes,write_bytes"
+  fields = "process,task_id,name,status,cpus,memory,realtime,time,%cpu,peak_rss,read_bytes,write_bytes"
 }
 ```
+
+**Key fields:**
+- `cpus`, `memory`, `time` — requested resources  
+- `%cpu`, `peak_rss`, `realtime` — actual usage
+- `read_bytes`, `write_bytes` — I/O volume (optional but recommended)
