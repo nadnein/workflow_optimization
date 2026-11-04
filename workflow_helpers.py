@@ -7,6 +7,7 @@ Nextflow trace files to identify resource optimization opportunities and
 compare resource usage across pipeline runs.
 """
 
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
@@ -83,41 +84,34 @@ def truncate_left(text, max_len=40, prefix="..."):
     return prefix + text[-keep:]
 
 
-def _print_group_consistency_summary(
-    group_name: str,
-    group_process_df: pd.DataFrame,
-    group_filenames: List[str],
-    group_labels: List[str],
+def _print_consistency_summary(
+    process_df: pd.DataFrame,
+    filenames: List[str],
+    labels: List[str],
     consistent_processes: List[str],
 ) -> None:
-    """Print a concise consistency summary for one comparison group."""
-    total_unique = group_process_df["process"].nunique()
+    """Print a concise summary of which processes are shared across runs."""
+    total_unique = process_df["process"].nunique()
     consistent_set = set(consistent_processes)
     shared_pct = (len(consistent_set) / total_unique * 100.0) if total_unique else 0.0
 
-    print(f"Consistency: {group_name}")
-
-    exclusive_counts = []
-    for filename, label in zip(group_filenames, group_labels):
-        run_processes = set(
-            group_process_df.loc[group_process_df["filename"] == filename, "process"]
-        )
-        exclusive = sorted(run_processes - consistent_set)
-        exclusive_counts.append(len(exclusive))
-
+    print("Consistency")
     print(
         f"  Shared: {len(consistent_set)}/{total_unique} process(es) "
-        f"across {len(group_labels)} run(s) ({shared_pct:.1f}%)"
+        f"across {len(labels)} run(s) ({shared_pct:.1f}%)"
     )
+
+    exclusive_counts = [
+        len(set(process_df.loc[process_df["filename"] == f, "process"]) - consistent_set)
+        for f in filenames
+    ]
     if sum(exclusive_counts) == 0:
         print("  Run-specific: none")
     else:
-        run_specific_summary = ", ".join(
-            f"{label} {count}"
-            for label, count in zip(group_labels, exclusive_counts)
+        print(
+            "  Run-specific: "
+            + ", ".join(f"{label} {n}" for label, n in zip(labels, exclusive_counts))
         )
-        print(f"  Run-specific: {run_specific_summary}")
-
     print()
 
 
@@ -250,83 +244,88 @@ def load_and_preprocess_trace(trace_path, verbose=True):
 
     return df
 
-def load_comparison_groups(comparison_groups: Dict) -> Tuple[pd.DataFrame, pd.DataFrame, List[Path], List[str]]:
+def find_trace_files(pipeline: str, data_dir: Path | str = "data") -> List[Path]:
+    """Return all trace files in ``data_dir`` subfolders whose name contains ``pipeline``.
+
+    Folder matching is a case-insensitive substring match, so ``"rnaseq"``
+    picks up ``data/rnaseq`` as well as e.g. ``data/rnaseq_ramses``.
     """
-    Load and process multiple comparison groups of trace files.
-    
-    Args:
-        comparison_groups: Dict mapping group names to trace file configs
-            Each group should have:
-                - trace_files: List of Path objects to trace files
-                - labels: Optional list of labels (uses filenames if not provided)
-        
+    data_dir = Path(data_dir)
+    folders = sorted(
+        d for d in data_dir.iterdir()
+        if d.is_dir() and pipeline.lower() in d.name.lower()
+    )
+    if not folders:
+        raise FileNotFoundError(
+            f"No folder containing '{pipeline}' found in {data_dir.resolve()}"
+        )
+    trace_files = [f for d in folders for f in sorted(d.glob("*.txt"))]
+    if not trace_files:
+        raise FileNotFoundError(
+            f"No .txt trace files in: {', '.join(str(d) for d in folders)}"
+        )
+    return trace_files
+
+
+def _run_label(trace_file: Path) -> str:
+    """Readable run label: file stem without the trailing timestamp."""
+    stem = re.sub(r"_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$", "", trace_file.stem)
+    return stem.replace("_", " ")
+
+
+def load_pipeline_traces(
+    pipeline: str, data_dir: Path | str = "data"
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[Path], List[str]]:
+    """Load and process every trace file of a pipeline.
+
+    Trace files are discovered with :func:`find_trace_files`: all ``*.txt``
+    files in the ``data_dir`` subfolders whose name contains ``pipeline``.
+
     Returns:
-        Tuple of (run_summary_df, process_df, all_trace_files, all_labels)
+        Tuple of (run_summary_df, process_df, trace_files, labels)
     """
-    print("Comparison Groups")
-    print(f"  Total: {len(comparison_groups)}")
-    for group_name, group in comparison_groups.items():
-        print(f"  - {group_name}: {len(group['trace_files'])} run(s)")
-    print()
- 
+    trace_files = find_trace_files(pipeline, data_dir)
+    labels = [_run_label(f) for f in trace_files]
+    if len(set(labels)) != len(labels):  # fall back to full stems if ambiguous
+        labels = [f.stem for f in trace_files]
+
+    print(f"Pipeline: {pipeline} | {len(trace_files)} run(s)")
+
     run_results = []
     process_records = []
-    all_trace_files = []
-    all_labels = []
- 
-    for group_name, group_config in comparison_groups.items():
-        trace_files_group = group_config["trace_files"]
-        labels_group = group_config.get("labels")
- 
-        # Use filenames if no labels provided
-        if not labels_group or len(labels_group) != len(trace_files_group):
-            labels_group = [f.stem for f in trace_files_group]
- 
-        print(f"Runs: {group_name}")
-        for trace_file, label in zip(trace_files_group, labels_group):
-            df_trace = load_and_preprocess_trace(trace_file, verbose=False)
-            run_metrics = build_run_summary(df_trace)
-            run_metrics["filename"] = trace_file.stem
-            run_metrics["group"] = group_name
-            run_metrics["label"] = label
+    for trace_file, label in zip(trace_files, labels):
+        df_trace = load_and_preprocess_trace(trace_file, verbose=False)
+        run_metrics = build_run_summary(df_trace)
+        run_metrics["filename"] = trace_file.stem
+        run_metrics["label"] = label
+        run_results.append(run_metrics)
 
-            print(
-                f"  - {label}"
-                f" | {len(df_trace)} task(s)"
-                f" | {run_metrics['process_count']} process(es)"
-                f" | {trace_file.name}"
-            )
- 
-            # Run-level summary
-            run_results.append(run_metrics)
- 
-            # Per-process summary
-            pp = build_per_process_summary(df_trace)
-            pp["filename"] = trace_file.stem
-            pp["group"] = group_name
-            pp["label"] = label
-            pp["process_display"] = make_display_labels(
-                pp["process"], max_len=20
-            )
-            pp["process_name"] = make_unique_labels(pp["process"])
-            process_records.append(pp)
- 
-            all_trace_files.append(trace_file)
-            all_labels.append(label)
-        print()
- 
+        print(
+            f"  - {label}"
+            f" | {len(df_trace)} task(s)"
+            f" | {run_metrics['process_count']} process(es)"
+            f" | {trace_file.parent.name}/{trace_file.name}"
+        )
+
+        pp = build_per_process_summary(df_trace)
+        pp["filename"] = trace_file.stem
+        pp["label"] = label
+        pp["process_display"] = make_display_labels(pp["process"], max_len=20)
+        pp["process_name"] = make_unique_labels(pp["process"])
+        process_records.append(pp)
+    print()
+
     run_summary_df = pd.DataFrame(run_results)
     process_df = pd.concat(process_records, ignore_index=True)
-    process_df = annotate_consistent_processes(process_df, comparison_groups)
+    process_df = annotate_consistent_processes(process_df)
 
     print("Summary")
     print(
         f"  {len(run_summary_df)} run(s)"
         f" | {process_df['process'].nunique()} unique process(es)"
-        f" | {len(comparison_groups)} group(s)"
     )
- 
-    return run_summary_df, process_df, all_trace_files, all_labels
+
+    return run_summary_df, process_df, trace_files, labels
 
 # ══════════════════════════════════════════════════════════════════════════════
 # RESOURCE CALCULATIONS
@@ -738,52 +737,25 @@ def identify_consistent_processes(process_df, run_files, run_labels, verbose=Tru
 
 
 def annotate_consistent_processes(
-    process_df: pd.DataFrame, comparison_groups: Dict, verbose: bool = True
+    process_df: pd.DataFrame, verbose: bool = True
 ) -> pd.DataFrame:
-    """Add an ``is_consistent`` flag showing whether each process is present in all runs of its group."""
+    """Add an ``is_consistent`` flag showing whether each process is present in all runs."""
     process_df = process_df.copy()
-    process_df["is_consistent"] = False
 
-    for group_name, group_config in comparison_groups.items():
-        group_trace_files = group_config["trace_files"]
-        group_labels = group_config.get("labels")
+    runs = process_df[["filename", "label"]].drop_duplicates()
+    filenames = runs["filename"].tolist()
+    labels = runs["label"].tolist()
 
-        if not group_labels or len(group_labels) != len(group_trace_files):
-            group_labels = [f.stem for f in group_trace_files]
-
-        group_filenames = [f.stem for f in group_trace_files]
-        group_mask = process_df["group"] == group_name
-        group_process_df = process_df[group_mask]
-
-        if len(group_trace_files) == 1:
-            if verbose:
-                _print_group_consistency_summary(
-                    group_name=group_name,
-                    group_process_df=group_process_df,
-                    group_filenames=group_filenames,
-                    group_labels=group_labels,
-                    consistent_processes=sorted(group_process_df["process"].unique()),
-                )
-            process_df.loc[group_mask, "is_consistent"] = True
-            continue
-
+    if len(filenames) == 1:
+        consistent_procs = sorted(process_df["process"].unique())
+    else:
         consistent_procs = identify_consistent_processes(
-            group_process_df, group_filenames, group_labels, verbose=False
+            process_df, filenames, labels, verbose=False
         )
+    process_df["is_consistent"] = process_df["process"].isin(consistent_procs)
 
-        process_df.loc[
-            group_mask & process_df["process"].isin(consistent_procs),
-            "is_consistent",
-        ] = True
-
-        if verbose:
-            _print_group_consistency_summary(
-                group_name=group_name,
-                group_process_df=group_process_df,
-                group_filenames=group_filenames,
-                group_labels=group_labels,
-                consistent_processes=consistent_procs,
-            )
+    if verbose:
+        _print_consistency_summary(process_df, filenames, labels, consistent_procs)
 
     return process_df
 
@@ -906,23 +878,17 @@ def _build_process_color_map(processes: List[str]) -> Dict[str, str]:
 def create_process_scaling_explorer(
     process_df: pd.DataFrame,
     run_summary_df: pd.DataFrame,
-    group_name: str,
     top_n: int = 15,
 ) -> go.Figure | None:
-    """Create an interactive per-group scaling explorer for consistent processes."""
-    group_process_df = process_df[
-        (process_df["group"] == group_name) & (process_df["is_consistent"])
-    ].copy()
+    """Create an interactive scaling explorer for consistent processes."""
+    long_df = process_df[process_df["is_consistent"]].copy()
 
-    if group_process_df.empty:
+    if long_df.empty:
         return None
 
-    group_run_df = run_summary_df[run_summary_df["group"] == group_name].copy()
-    group_labels = group_run_df["label"].tolist()
-
-    long_df = group_process_df.copy()
+    run_labels = run_summary_df["label"].tolist()
     long_df["run_label"] = long_df["label"]
-    run_order = {label: idx for idx, label in enumerate(group_labels)}
+    run_order = {label: idx for idx, label in enumerate(run_labels)}
     long_df["run_idx"] = long_df["run_label"].map(run_order)
 
     resource_config = [
@@ -1037,7 +1003,7 @@ def create_process_scaling_explorer(
                 {
                     "yaxis.title.text": y_title,
                     "title.text": (
-                        f"Process Scaling Explorer — {group_name}"
+                        "Process Scaling Explorer"
                         f"<br><sup>Top {top_n} consistent processes ranked by {resource_name}</sup>"
                     ),
                 },
@@ -1049,7 +1015,7 @@ def create_process_scaling_explorer(
     fig.update_layout(
         title=dict(
             text=(
-                f"Process Scaling Explorer — {group_name}"
+                "Process Scaling Explorer"
                 f"<br><sup>Top {top_n} consistent processes ranked by CPU</sup>"
             ),
             x=0.01,
