@@ -9,3 +9,9 @@ wheels/
 # Virtual environments
 .venv
 .claude/settings.local.json
+
+# Downloaded nf-core megatest results
+megatest_summary/
+
+# Reduced tables derived from our own cluster traces
+own_summary/
