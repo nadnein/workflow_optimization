@@ -1,23 +1,29 @@
 # Project instructions
 
 ## Project overview
-- Purpose: analyse raw Nextflow `trace` files (`*.txt`, tab-separated) to compare
-  pipeline runs and rank processes by resource-optimisation potential. Metrics are
-  CPU core-hours, peak-RSS-weighted GB-hours, runtime hours, and I/O GB, plus
-  used-vs-requested efficiency and variability. Output is interactive Plotly
-  dashboards in a Jupyter notebook, not a CLI tool.
-- Main languages / frameworks: Python 3.13, pandas, numpy, Plotly
+- Purpose: find the processes of the Nextflow pipelines used at the institution (rnaseq,
+  ampliseq, scrnaseq first) where better resource requests pay off, and derive request
+  formulas depending on input size. Primary data: our own cluster traces (`data/<pipeline>/*.txt`);
+  guidance: the public nf-core AWS test results. Output: CSV tables, Plotly plots and a
+  Jupyter notebook that ties the steps together (`docs/workflow.md`).
+- Main languages / frameworks: Python 3.13, pandas, numpy, boto3 (anonymous S3), pyarrow, Plotly
   (`graph_objects`, `subplots`), `ipywidgets`/IPython for interactivity.
 - Important directories and files:
-  - `workflow_helpers.py` — the whole library (~1200 lines): loading, cleaning,
-    derived metrics, consistency detection, plotting.
-  - `notebooks/Resource Contribution Scaling Analysis.ipynb` — the entry point
-    (setup → load → inspect tables → three interactive views).
-  - `data/<pipeline>/*.txt` — Nextflow traces; folder name must contain the
-    pipeline name (case-insensitive substring match).
-  - `test.py` — plotting prototypes (efficiency bars, bubble plot, score plot);
-    **not** a test suite.
-  - `main.py` — unused `uv init` placeholder.
+  - Layout: `notebooks/`, `scripts/` (all Python code, run from the repo root), `docs/`, `data/`, generated
+    `megatest_summary/` and `own_summary/`.
+  - `notebooks/Resource Optimization Workflow.ipynb` — the entry point; follows `docs/workflow.md`.
+  - `docs/workflow.md` (the workflow), `docs/tool_resource_scaling.md` (research notes with sources),
+    `docs/tool_scaling_evidence.csv` (machine-readable version).
+  - `scripts/megatest_waste.py` (AWS test tables), `scripts/input_sizes.py`, `scripts/rchar_vs_input.py`, `scripts/own_traces.py`
+    (our traces to the same per-task table), `scripts/pipeline_view.py`, `scripts/shortlist.py`, `scripts/module_candidates.py`,
+    `scripts/module_detail.py`, `scripts/plot_scaling.py` — scripts, documented in README.md. Outputs go to the
+    git-ignored `megatest_summary/` (AWS) and `own_summary/` (our traces).
+  - `docs/experiment_plan.md` (phases and gates to formulas), `docs/module_profiles.md` (config and tool
+    characteristics per module), `docs/related_work.md` (how other prediction methods work).
+  - `scripts/workflow_helpers.py` — library for the detailed views of our own runs (section 5 of the
+    notebook): loading, derived metrics, optimization priority, plots.
+  - `data/<pipeline>/*.txt` — our Nextflow traces; folder name must contain the
+    pipeline name (case-insensitive substring match). Traces should be raw (`trace.raw = true`).
   - `uv.lock` — resolved dependency lockfile.
 
 ## Environment and setup
@@ -26,28 +32,28 @@
 - Dependency installation: `uv sync` (README). Package manager is **uv**;
   `uv.lock` is committed and `.venv/` is git-ignored.
 - Configuration / environment variables: no `.env` usage and no environment
-  variables are read in code. The only configuration is in the notebook cell:
-  `PIPELINE = "rnaseq"` and `DATA_DIR = PROJECT_ROOT / "data"`.
-- External services: none. No network calls, no shelling out.
-- Declared dependencies in `pyproject.toml`: `ipykernel`, `jupyter`,
-  `matplotlib`, `numpy`, `pandas`. Note: `plotly` is imported everywhere but is
-  **not** declared in `pyproject.toml` (it is present in `.venv`/`uv.lock`
-  transitively); `dash` is imported by `test.py` but appears in neither
-  `pyproject.toml` nor `uv.lock`. TODO: ask the user whether these should be
-  added as explicit dependencies or the imports removed.
+  variables are read in code. Configuration is the first cell of the notebook (`PIPELINES`,
+  `VIEW_PIPELINE`, directories) and script command-line options.
+- External services: only `scripts/megatest_waste.py` and `scripts/input_sizes.py` use the network, anonymously
+  (public S3 bucket `nf-core-awsmegatests`, GitHub raw and public S3 for samplesheet file sizes);
+  they download no raw data. `scripts/megatest_waste.py` keeps only runs whose `-profile` contains `test_full`. All other scripts and the notebook work offline on the saved tables.
+  Our own traces never leave the machine: `scripts/own_traces.py` reduces them locally.
+- Declared dependencies in `pyproject.toml`: `ipykernel`, `jupyter`, `matplotlib`, `numpy`,
+  `pandas`, `boto3`, `pyarrow`, `plotly`.
 
 ## Development workflow
 - Run: `uv run jupyter notebook`, then open
-  `notebooks/Resource Contribution Scaling Analysis.ipynb` and select the
+  `notebooks/Resource Optimization Workflow.ipynb` and select the
   `.venv` kernel. Notebook charts render with `renderer="plotly_mimetype"`.
-- Tests: no test framework, no `tests/` directory, no CI config, and `test.py`
-  contains no assertions. TODO: ask the user how tests should be run.
+  Scripts: `uv run python <script>.py --help`.
+- Tests: no test framework, no `tests/` directory, no CI config. TODO: ask the
+  user how tests should be run.
 - Linting / formatting: no ruff/black/flake8/mypy configuration and no
   `[tool.*]` sections in `pyproject.toml`. TODO: ask the user for the intended
   formatter/linter.
 - Build / validation: nothing to build. Minimal smoke check is loading a trace
-  in Python (`load_and_preprocess_trace`) or re-running notebook section 2; avoid
-  re-running the full notebook unnecessarily.
+  in Python (`load_and_preprocess_trace`) or `scripts/own_traces.py`; a notebook check can be run
+  into a scratch copy (`jupyter nbconvert --execute --output-dir <scratch>`) so repo outputs stay untouched.
 
 ## Project-specific conventions
 - Architecture: pure functions over pandas DataFrames, no classes, no global

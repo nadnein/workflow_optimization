@@ -1,31 +1,34 @@
 # Handoff
 
 ## Goal
-Analyse raw Nextflow trace files to compare pipeline runs and rank processes by resource-optimisation potential, shown as interactive Plotly dashboards in a Jupyter notebook. Current focus: load traces by pipeline name from `data/` folders instead of hand-written comparison groups.
+Use the public nf-core AWS megatest results (`s3://nf-core-awsmegatests`) to find modules whose CPU/memory/runtime follow input size, and end with a usable resource formula for 2-3 modules. Only results with usage data (`peak_rss`, `%cpu`) from 2023 on matter, and raw data is not kept.
 
 ## State
-- **Done and pushed to `origin/main`** (`049dd72`): comparison groups removed.
-  - `workflow_helpers.py`: `load_pipeline_traces(pipeline, data_dir)` and `find_trace_files` replace `load_comparison_groups`. The `group` column is gone. `annotate_consistent_processes` and `create_process_scaling_explorer` no longer take group arguments.
-  - Notebook `notebooks/Resource Contribution Scaling Analysis.ipynb`: config cell is `PIPELINE = "rnaseq"` plus `DATA_DIR`; the scaling explorer cell has no group dropdown.
-  - Traces moved from `data/rnaseq_runs/` to `data/rnaseq/`. README has a note on the folder convention.
-- **Committed locally, not pushed**: `d367500` on branch `add-agent-instructions` adds `AGENTS.md` and `CLAUDE.md`. No upstream is set and no PR exists.
-- **Verified**: `load_pipeline_traces("rnaseq", "data")` and `create_process_scaling_explorer` run on the two rnaseq traces. The full notebook was not re-run.
-- **Stale**: the two notebook cells I rewrote have cleared outputs; other cells still hold old outputs showing a `group` column.
-- **Not run**: `/check-setup` failed (`Operation not permitted` on `/Users/nadja/Documents/code_files/coding-agent-setup/scripts/`), so the setup repo's freshness is unknown.
+Nothing from this work is committed. `git status`: modified `.gitignore`, `README.md`, `AGENTS.md`, `HANDOFF.md`, `pyproject.toml` (boto3, pyarrow, plotly), `uv.lock`; deleted `notebooks/Resource Contribution Scaling Analysis.ipynb` and `test.py` (authorised, in git history); new `notebooks/Resource Optimization Workflow.ipynb`, `docs/`, and the scripts below.
+
+Entry point: **`notebooks/Resource Optimization Workflow.ipynb`** (follows `docs/workflow.md`; executed end to end without errors in a scratch copy, widget output and plots not looked at in a browser). `scripts/workflow_helpers.py` is kept because section 5 of the notebook (priority ranking, burden per process, scaling across runs, carried over from the old notebook) uses it. `main.py` is an unrelated unused placeholder.
+
+Scripts (`scripts/`, documented in `README.md`; outputs in git-ignored `megatest_summary/` = AWS tests and `own_summary/` = our traces):
+1. `scripts/megatest_waste.py --all`: per-task table from the nf-core AWS tests (343,620 tasks, 91 pipelines, runs from 2023) and two module rankings. `scripts/input_sizes.py`: real input size per sample (435 of 684 runs resolved). `scripts/rchar_vs_input.py`: `rchar` tracks real input size (median Spearman 0.68).
+2. `scripts/own_traces.py PIPELINE...`: our traces from `data/<pipeline>/` to the same per-task table (failed tasks kept; needs raw traces). Tested on the two rnaseq traces in `data/rnaseq/`; ampliseq and scrnaseq traces do not exist yet.
+3. `scripts/pipeline_view.py` (metrics), `scripts/shortlist.py` (four criteria + research notes `docs/tool_scaling_evidence.csv`; no module dropped for few tasks, marked `low data`), `scripts/module_candidates.py`, `scripts/module_detail.py`, `scripts/plot_scaling.py` (`--data`/`--out` select AWS or own table).
+4. `docs/tool_resource_scaling.md`: documented scaling behaviour of 19 tools with sources and evidence levels.
 
 ## Decisions
-- Folder match is a case-insensitive substring of the pipeline name, as the user asked ("folders in data that contain the name of the pipeline"). Consequence: `"rnaseq"` also matches e.g. `data/rnaseq_ramses`.
-- Run labels are the filename stem minus the trailing timestamp, so they changed from "rnaseq test" / "rnaseq test full" to "rnaseq test trace" / "rnaseq test full trace". Falls back to full stems if labels collide.
-- Consistency is now judged across all loaded runs of the pipeline.
+- `results-test-*` runs, runs before 2023, undated runs and runs without usage data are skipped. Everything else counts as full-size (this still includes small ad-hoc runs).
+- Rankings use waste per task averaged over pipelines, not totals, so AWS testing frequency does not drive the order. Modules with fewer than 10 tasks sort last.
+- Tool versions are normalised (lowercase, no `-`/`_`, no quotes) so equal versions pool; the main CSV is one row per module, version detail lives in `scripts/module_detail.py`.
+- `rchar` replaces `read_bytes` as the input proxy (filled for 99.9 % of tasks vs 44 %).
+- Memory/walltime efficiency are not flagged (nearly all modules use under 10 % of the request).
 
 ## Next steps
-1. Push the branch: `git push -u origin add-agent-instructions`, then open a PR into `main` or fast-forward merge it (the user asked for the commands and has not run them yet).
-2. Re-run the notebook (section 2 onward) so stale outputs show no `group` column. This rewrites outputs, so ask the user first.
-3. Ask the user about the TODOs in `AGENTS.md`: `plotly` is not declared in `pyproject.toml`, `dash` is imported by `test.py` but absent from `pyproject.toml` and `uv.lock`, and there is no test or lint setup.
+1. User runs the full-size tests of rnaseq, ampliseq and scrnaseq on the cluster with `trace.raw = true` and the fields in the README, puts the traces into `data/<pipeline>/` (not into the chat: traces are sensitive), then run `scripts/own_traces.py` and the notebook sections 2-4. Own runs are the main evidence, AWS the guidance.
+2. Open the notebook and the plots in `megatest_summary/plots/` in a browser and fix layout problems.
+3. Pick 2-3 modules (suggested: `PICARD_MARKDUPLICATES`, `TRIMGALORE`, `FASTQC`; `MIRDEEP2` in smrnaseq has the largest saving), run size experiments where the input range is narrow, then build the formula fitting (step 6 of `docs/workflow.md`, not built). Commit the work.
 
 ## Traps
-- Do not modify or delete anything under `data/`; these are real run traces. Ask first.
-- Do not re-resolve `uv.lock` without approval.
-- Existing `data/` entries such as `execution_trace_*.txt` sit directly in `data/`, not in a subfolder, so `find_trace_files` ignores them.
-- Run Python via `.venv/bin/python` or `uv run`, not system `python3`.
-- `test.py` is a plotting prototype, not a test suite.
+- Run Python via `uv run`; system `python3` is not available. The sandbox hides the process list (`pgrep`, `ps`, `pkill` fail).
+- Do not modify or delete anything under `data/`. Ask before re-resolving `uv.lock`.
+- Real input sizes exist for only about 64 % of runs; e.g. PICARD_MARKDUPLICATES has them for 90 of 611 tasks. Use `--x rchar` for full coverage. AWS test inputs span a narrow range, so do not extrapolate far.
+- A full `scripts/megatest_waste.py --all` takes several minutes and a few GB of network traffic; `--reuse` rebuilds the CSVs from the saved parquet. `scripts/input_sizes.py` needs the network; rerun it to continue from its cache.
+- zsh aborts a whole `&&` chain when `rm -f` has a glob that matches nothing.
